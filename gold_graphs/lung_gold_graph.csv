@@ -1,0 +1,9 @@
+source,target
+gender,smoking
+age,smoking
+age,lesion
+smoking,lesion
+lesion,score
+smoking,score
+age,score
+gender,score

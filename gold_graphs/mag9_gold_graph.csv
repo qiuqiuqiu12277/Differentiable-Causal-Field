@@ -1,0 +1,15 @@
+source,target
+nutrition,score
+color,recmd
+size,recmd
+defects,aroma
+defects,taste
+defects,recmd
+defects,score
+aroma,taste
+aroma,score
+taste,recmd
+taste,score
+juiciness,taste
+juiciness,score
+recmd,score
