@@ -7,10 +7,9 @@ Causal-VidQA, MAG, and Lung can share training/evaluation code.
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import torch
@@ -18,13 +17,18 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from metacausal_field import SimpleTokenizer
-from train_metacausal_field import label_to_class, numeric_factor_columns, prepare_metadata
+from train_metacausal_field import (
+    label_to_class,
+    prepare_metadata,
+    split_dataframe,
+)
 
 
 @dataclass
 class CausalSample:
     sample_id: str
     split: str
+    group_id: Optional[str] = None
     image_path: Optional[str] = None
     video_path: Optional[str] = None
     counterfactual_image_path: Optional[str] = None
@@ -46,6 +50,25 @@ class CausalSample:
     feature_key: Optional[str] = None
     choices: List[str] = field(default_factory=list)
     objects: List[Dict[str, Any]] = field(default_factory=list)
+
+
+def clean_optional_string(value, default: str = "") -> str:
+    """Convert a scalar to text without turning CSV nulls into ``'nan'``."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return default
+    return str(value)
+
+
+def sample_feature_key(sample: CausalSample) -> str:
+    """Return a question/sample-specific cache key."""
+    return clean_optional_string(sample.feature_key) or clean_optional_string(sample.sample_id)
+
+
+def counterfactual_feature_key(sample: CausalSample) -> str:
+    base = sample_feature_key(sample)
+    if sample.counterfactual_image_path or sample.counterfactual_video_path:
+        return f"{base}::counterfactual"
+    return base
 
 
 def read_manifest(path: str) -> List[Dict]:
@@ -162,23 +185,29 @@ class UnifiedCausalDataset(Dataset):
         transform=None,
         factor_names: Optional[List[str]] = None,
         num_video_frames: int = 8,
+        allow_missing_media: bool = False,
+        skip_media_loading: bool = False,
     ):
         self.samples = samples
         self.tokenizer = tokenizer
         self.transform = transform
         self.num_video_frames = max(1, int(num_video_frames))
+        self.allow_missing_media = bool(allow_missing_media)
+        self.skip_media_loading = bool(skip_media_loading)
         self.factor_names = factor_names or sorted({name for s in samples for name in s.factors})
 
     def __len__(self):
         return len(self.samples)
 
     def _load_image(self, image_path: Optional[str], video_path: Optional[str] = None):
+        errors = []
         if image_path:
             try:
-                image = Image.open(image_path).convert("RGB")
+                with Image.open(image_path) as source:
+                    image = source.convert("RGB")
                 return self.transform(image) if self.transform else image
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(f"image={image_path!r}: {exc}")
         if video_path:
             try:
                 from torchvision.io import read_video
@@ -198,8 +227,16 @@ class UnifiedCausalDataset(Dataset):
                             from torchvision.transforms.functional import to_tensor
                             video_frames.append(to_tensor(image))
                     return torch.stack(video_frames, dim=0)
-            except Exception:
-                pass
+                errors.append(f"video={video_path!r}: contained no frames")
+            except Exception as exc:
+                errors.append(f"video={video_path!r}: {exc}")
+        if not self.allow_missing_media:
+            requested = ", ".join(x for x in (image_path, video_path) if x) or "<empty path>"
+            details = "; ".join(errors)
+            raise FileNotFoundError(
+                f"Required media could not be loaded ({requested}). {details} "
+                "Pass allow_missing_media=True only for explicit smoke tests."
+            )
         image = Image.new("RGB", (224, 224), "white")
         return self.transform(image) if self.transform else image
 
@@ -207,13 +244,21 @@ class UnifiedCausalDataset(Dataset):
         sample = self.samples[idx]
         text = sample.question or sample.text or sample.factual_text
         answer_text = sample.answer or sample.counterfactual_text or sample.text
+        if self.skip_media_loading:
+            image = torch.empty(0)
+            cf_image = torch.empty(0)
+        else:
+            image = self._load_image(sample.image_path, sample.video_path)
+            cf_image = (
+                self._load_image(sample.counterfactual_image_path, sample.counterfactual_video_path)
+                if (sample.counterfactual_image_path or sample.counterfactual_video_path)
+                else image.clone() if isinstance(image, torch.Tensor) else image.copy()
+            )
         return {
             "sample_id": sample.sample_id,
             "split": sample.split,
-            "image": self._load_image(sample.image_path, sample.video_path),
-            "cf_image": self._load_image(sample.counterfactual_image_path, sample.counterfactual_video_path)
-            if (sample.counterfactual_image_path or sample.counterfactual_video_path)
-            else self._load_image(sample.image_path, sample.video_path),
+            "image": image,
+            "cf_image": cf_image,
             "image_path": sample.image_path or "",
             "video_path": sample.video_path or "",
             "counterfactual_image_path": sample.counterfactual_image_path or "",
@@ -236,8 +281,8 @@ class UnifiedCausalDataset(Dataset):
             "object_id": sample.object_id or "",
             "bbox": torch.tensor(sample.bbox or [-1, -1, -1, -1], dtype=torch.float32),
             "mask_path": sample.mask_path or "",
-            "feature_key": sample.feature_key or sample.image_path or sample.video_path or sample.sample_id,
-            "cf_feature_key": sample.counterfactual_image_path or sample.counterfactual_video_path or sample.feature_key or sample.image_path or sample.video_path or sample.sample_id,
+            "feature_key": sample_feature_key(sample),
+            "cf_feature_key": counterfactual_feature_key(sample),
             "choices": sample.choices,
             "objects": sample.objects,
         }
@@ -266,27 +311,40 @@ def samples_from_manifest(manifest_path: str, data_root: Optional[str] = None, d
             except json.JSONDecodeError:
                 choices = [x.strip() for x in choices.split("|") if x.strip()]
         samples.append(CausalSample(
-            sample_id=str(row.get("sample_id", row.get("id", i))),
-            split=str(row.get("split", default_split)),
+            sample_id=clean_optional_string(row.get("sample_id", row.get("id", i)), str(i)),
+            split=clean_optional_string(row.get("split", default_split), default_split),
+            group_id=clean_optional_string(row.get("group_id")) or None,
             image_path=image_path,
             video_path=video_path,
             counterfactual_image_path=cf_image_path,
             counterfactual_video_path=cf_video_path,
-            text=str(row.get("text", row.get("caption", ""))),
-            question=str(row.get("question", "")),
-            answer=str(row.get("answer", row.get("label", ""))),
-            question_type=str(row.get("question_type", row.get("type", "Descriptive"))),
+            text=clean_optional_string(row.get("text", row.get("caption", ""))),
+            question=clean_optional_string(row.get("question", "")),
+            answer=clean_optional_string(row.get("answer", row.get("label", ""))),
+            question_type=clean_optional_string(
+                row.get("question_type", row.get("type", "Descriptive")),
+                "Descriptive",
+            ),
             factors={str(k): float(v) for k, v in factors.items()} if isinstance(factors, dict) else {},
             graph_edges=normalize_edges(row.get("graph_edges", row.get("edges"))),
             intervention=parse_intervention(row.get("intervention")),
-            factual_text=str(row.get("factual_text", row.get("source_text", row.get("text", "")))),
-            counterfactual_text=str(row.get("counterfactual_text", row.get("target_text", row.get("cf_text", "")))),
-            cf_answer=row.get("cf_answer", row.get("counterfactual_answer")),
-            ood_type=str(row.get("ood_type", row.get("domain", "in_domain"))),
-            object_id=str(row.get("object_id", "")) if row.get("object_id") is not None else None,
+            factual_text=clean_optional_string(
+                row.get("factual_text", row.get("source_text", row.get("text", "")))
+            ),
+            counterfactual_text=clean_optional_string(
+                row.get("counterfactual_text", row.get("target_text", row.get("cf_text", "")))
+            ),
+            cf_answer=(
+                clean_optional_string(row.get("cf_answer", row.get("counterfactual_answer"))) or None
+            ),
+            ood_type=clean_optional_string(
+                row.get("ood_type", row.get("domain", "in_domain")),
+                "in_domain",
+            ),
+            object_id=clean_optional_string(row.get("object_id")) or None,
             bbox=parse_bbox(row.get("bbox", row.get("box"))),
             mask_path=row.get("mask_path"),
-            feature_key=row.get("feature_key"),
+            feature_key=clean_optional_string(row.get("feature_key")) or None,
             choices=[str(x) for x in choices] if isinstance(choices, list) else [],
             objects=parse_objects(row.get("objects")),
         ))
@@ -321,6 +379,7 @@ def load_clevrer(manifest_path: str, data_root: Optional[str] = None) -> List[Ca
             samples.append(CausalSample(
                 sample_id=str(q.get("question_id", f"{vid_idx}_{q_idx}")),
                 split=str(q.get("split", video.get("split", "train"))),
+                group_id=str(video.get("video_id", video.get("id", vid_idx))),
                 video_path=video_path,
                 question=str(q.get("question", q.get("query", ""))),
                 answer=str(q.get("answer", q.get("label", ""))),
@@ -388,6 +447,7 @@ def load_causal_vidqa(manifest_path: str, data_root: Optional[str] = None) -> Li
             samples.append(CausalSample(
                 sample_id=str(q.get("id", q.get("question_id", f"{vid_idx}_{q_idx}"))),
                 split=str(q.get("split", item.get("split", "train"))),
+                group_id=str(item.get("video_id", item.get("id", vid_idx))),
                 video_path=video_path,
                 text=str(item.get("caption", "")),
                 question=str(q.get("question", q.get("query", ""))),
@@ -407,8 +467,18 @@ def load_causal_vidqa(manifest_path: str, data_root: Optional[str] = None) -> Li
     return samples
 
 
-def load_mag_lung(dataset: str) -> Tuple[List[CausalSample], List[str]]:
+def load_mag_lung(dataset: str, seed: int = 42) -> Tuple[List[CausalSample], List[str]]:
     df, _, factor_names = prepare_metadata(dataset)
+    train_df, val_df, test_df = split_dataframe(
+        df,
+        seed=seed,
+        train_fraction=0.7,
+        val_fraction=0.15,
+    )
+    split_lookup = {}
+    id_column = "id" if "id" in df.columns else "ImagePath"
+    for split_name, partition in (("train", train_df), ("val", val_df), ("test", test_df)):
+        split_lookup.update({str(value): split_name for value in partition[id_column]})
     graph_file = Path("gold_graphs/mag9_gold_graph.csv" if dataset == "MAG9" else "gold_graphs/lung_gold_graph.csv")
     graph_edges = []
     if graph_file.exists():
@@ -423,7 +493,7 @@ def load_mag_lung(dataset: str) -> Tuple[List[CausalSample], List[str]]:
         }
         samples.append(CausalSample(
             sample_id=str(row.get("id", idx)),
-            split="train" if idx < int(len(df) * 0.8) else "test",
+            split=split_lookup[str(row[id_column])],
             image_path=str(row["ImagePath"]),
             text=str(row["Review"]),
             question="Describe the causal factors and predict the score.",
@@ -435,11 +505,16 @@ def load_mag_lung(dataset: str) -> Tuple[List[CausalSample], List[str]]:
     return samples, factor_names
 
 
-def load_benchmark(name: str, manifest_path: Optional[str] = None, data_root: Optional[str] = None) -> Tuple[List[CausalSample], List[str]]:
+def load_benchmark(
+    name: str,
+    manifest_path: Optional[str] = None,
+    data_root: Optional[str] = None,
+    seed: int = 42,
+) -> Tuple[List[CausalSample], List[str]]:
     if name in {"MAG9", "MAG"}:
-        return load_mag_lung("MAG9")
+        return load_mag_lung("MAG9", seed=seed)
     if name in {"Lung", "Lung4"}:
-        return load_mag_lung("Lung")
+        return load_mag_lung("Lung", seed=seed)
     if manifest_path is None:
         raise ValueError(f"{name} requires --manifest_path")
     if name == "CLEVRER":

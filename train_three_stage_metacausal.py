@@ -1,4 +1,4 @@
-"""Run the paper-style three-stage MetaCausalField training schedule.
+"""Run the paper-inspired three-stage InfluenceField prototype schedule.
 
 The stages are:
 1. factor_discovery: language/score/factor grounding, no CI/CF losses.
@@ -57,6 +57,8 @@ def run_stage(stage_name: str, base_args, extra_flags, init_checkpoint=None):
         str(base_args.lambda_sparsity),
         "--lambda_smoothness",
         str(base_args.lambda_smoothness),
+        "--seed",
+        str(base_args.seed),
     ]
     if base_args.influence_top_k is not None:
         cmd.extend(["--influence_top_k", str(base_args.influence_top_k)])
@@ -94,6 +96,7 @@ def main():
     parser.add_argument("--influence_top_k", type=int, default=None)
     parser.add_argument("--lambda_consistency", type=float, default=0.3)
     parser.add_argument("--lambda_counterfactual", type=float, default=0.5)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--backbone", default="resnet", choices=["resnet", "cached"])
     parser.add_argument("--feature_cache", default=None)
     parser.add_argument("--use_frozen_language_tokens", action="store_true")
@@ -123,6 +126,7 @@ def main():
     )
 
     summary = {
+        "seed": args.seed,
         "factor_discovery_checkpoint": str(ckpt1),
         "structure_learning_checkpoint": str(ckpt2),
         "counterfactual_reasoning_checkpoint": str(ckpt3),

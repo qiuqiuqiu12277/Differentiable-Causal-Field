@@ -1,3 +1,9 @@
+# 早期 MetaCausalField 实现说明（归档）
+
+> **状态：** 本文档对应早期原型，不等同于 InfluenceField 论文的
+> 完整实现或实验复现。请先阅读 [README.md](README.md) 与
+> [REPRODUCIBILITY.md](REPRODUCIBILITY.md)。
+
 # MetaCausalField 具体实现详解
 
 本文档用具体的代码示例和流程图，详细说明连续因果场是如何在代码中具体实现的。

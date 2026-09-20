@@ -1,22 +1,12 @@
-"""
-MetaCausalField: Differentiable Causal Field for Multimodal Causal Reasoning
+"""Core neural components for the InfluenceField research prototype.
 
-This module implements the core components of MetaCausalField, a unified framework 
-that replaces the three-stage pipeline of MLLM-CD (factor discovery → structure learning 
-→ counterfactual refinement) with an end-to-end differentiable causal field.
+The implementation exposes continuous field construction, directional influence,
+field-level intervention, iterative propagation, and optional language heads.  It
+is an evolving reference implementation rather than an exact reproduction of
+every experiment reported in the paper.
 
-Key innovations:
-1. Continuous Causal Field: Represents causal factors as continuous spatial distributions 
-   rather than discrete variables
-2. Directional Influence Function: Models causal relationships as continuous influence 
-   propagation instead of static graph edges
-3. Field-based Intervention: Enables direct manipulation of intermediate representations 
-   for counterfactual reasoning
-4. Dynamic Evolution: Captures temporal propagation of causal effects through iterative 
-   field updates
-
-Reference: "MetaCausalField: Unified Multimodal Causal Modeling via Differentiable 
-Causal Fields" (NeurIPS 2025 submission)
+Reference: "InfluenceField: A Differentiable Field with Interventionally
+Identifiable Causal Structure for Multimodal World Modeling" (arXiv:2609.07874).
 """
 
 import torch
@@ -47,6 +37,8 @@ class CausalFieldConfig:
         lambda_counterfactual: Weight for counterfactual rollout supervision
         lambda_sparsity: Weight for sparsity regularization
         lambda_smoothness: Weight for spatial smoothness regularization
+        lambda_factor_localization: Weight for optional factor-to-position supervision
+        lambda_factor_graph: Weight for optional factor-level graph supervision
         influence_top_k: Optional top-k outgoing influences to retain per location
         dropout: Dropout rate for regularization
     """
@@ -56,12 +48,15 @@ class CausalFieldConfig:
     num_propagation_steps: int = 3
     intervention_radius: float = 2.0
     gaussian_sigma: float = 1.0
+    gaussian_sigma_in_grid_units: bool = True
     use_temporal_dynamics: bool = True
     temporal_horizon: int = 5
     lambda_consistency: float = 0.3
     lambda_counterfactual: float = 0.5
     lambda_sparsity: float = 0.01
     lambda_smoothness: float = 0.001
+    lambda_factor_localization: float = 1.0
+    lambda_factor_graph: float = 1.0
     influence_top_k: Optional[int] = None
     dropout: float = 0.1
     vocab_size: int = 4096
@@ -309,15 +304,17 @@ class GaussianInterpolation(nn.Module):
     - Smooth spatial transitions between features
     """
     
-    def __init__(self, sigma: float = 1.0):
+    def __init__(self, sigma: float = 1.0, sigma_in_grid_units: bool = True):
         super().__init__()
         self.sigma = sigma
         self.sigma_sq = sigma ** 2
+        self.sigma_in_grid_units = bool(sigma_in_grid_units)
     
     def forward(self, 
                 features: torch.Tensor, 
                 patch_positions: torch.Tensor,
-                query_positions: Optional[torch.Tensor] = None) -> torch.Tensor:
+                query_positions: Optional[torch.Tensor] = None,
+                query_grid_shape: Optional[Tuple[int, int]] = None) -> torch.Tensor:
         """
         Args:
             features: [B, N, C] discrete patch features (N patches, C dimensions)
@@ -332,22 +329,34 @@ class GaussianInterpolation(nn.Module):
         
         if query_positions is None:
             # Create regular grid query positions
-            H, W = int(math.sqrt(N)), int(math.sqrt(N))
+            H, W = query_grid_shape or (int(math.sqrt(N)), int(math.sqrt(N)))
             y_grid = torch.linspace(0, 1, H, device=device)
             x_grid = torch.linspace(0, 1, W, device=device)
             yy, xx = torch.meshgrid(y_grid, x_grid, indexing='ij')
             query_positions = torch.stack([xx, yy], dim=-1).reshape(1, H * W, 2).expand(B, -1, -1)
         else:
-            H = W = int(math.sqrt(query_positions.shape[1]))
-        
-        Q = query_positions.shape[1]
+            if query_grid_shape is not None:
+                H, W = query_grid_shape
+            else:
+                H = W = int(math.sqrt(query_positions.shape[1]))
         
         # Compute pairwise distances: [B, Q, N]
         # ||p - p_i||² = ||p||² + ||p_i||² - 2·p·p_i
         query_expanded = query_positions.unsqueeze(2)  # [B, Q, 1, 2]
         patch_expanded = patch_positions.unsqueeze(1)   # [B, 1, N, 2]
         
-        dist_sq = torch.sum((query_expanded - patch_expanded) ** 2, dim=-1)  # [B, Q, N]
+        displacement = query_expanded - patch_expanded
+        if self.sigma_in_grid_units:
+            # Coordinates are normalized to [0,1], while the paper's sigma is
+            # expressed in field-grid cells. Convert displacements back to grid
+            # units so sigma=1 remains local on a 14x14 (or other) grid.
+            scale = torch.tensor(
+                [max(W - 1, 1), max(H - 1, 1)],
+                device=device,
+                dtype=displacement.dtype,
+            )
+            displacement = displacement * scale
+        dist_sq = torch.sum(displacement ** 2, dim=-1)  # [B, Q, N]
         
         # Gaussian weights
         weights = torch.exp(-dist_sq / (2 * self.sigma_sq))  # [B, Q, N]
@@ -363,20 +372,23 @@ class GaussianInterpolation(nn.Module):
 
 
 class DirectionalInfluenceFunction(nn.Module):
-    """Directional causal influence modeling between spatial positions.
+    """Directional influence modeling between spatial positions.
     
     Implements the influence function G(p_i → p_j) from Section 3.3:
     
         G(p_i, p_j) = MLP([F(p_i), F(p_j)])
     
     Unlike attention which measures correlation, this function explicitly models
-    directed causal influence with the following properties:
+    directed influence with the following properties:
     - Asymmetry: G(p_i → p_j) ≠ G(p_j → p_i) in general
     - Locality: Influence decays with spatial distance
     - Sparsity: Most positions have minimal influence on each other
     
-    The learned influence matrix G ∈ R^{N×N} serves as the continuous analog
-    of discrete causal graph edges.
+    The learned influence matrix is a structure candidate, not an identified
+    causal graph without the paper's intervention assumptions and evaluation.
+    Throughout this module ``G[..., i, j]`` means
+    influence from source position ``i`` to target position ``j``. Rows are
+    therefore normalized over outgoing targets, and propagation uses ``Gᵀ F``.
     """
     
     def __init__(
@@ -399,8 +411,8 @@ class DirectionalInfluenceFunction(nn.Module):
         self.key_proj = nn.Linear(feature_dim, feature_dim)
         self.value_proj = nn.Linear(feature_dim, feature_dim)
         
-        # Causal direction modeling (asymmetric)
-        self.direction_bias = nn.Parameter(torch.zeros(1, num_heads, 1, 1))
+        # Pair-dependent directional bias. A scalar added to every target logit
+        # would cancel exactly under softmax, so direction must depend on (i, j).
         self.directional_bias_proj = nn.Linear(3, num_heads, bias=False)
         
         # Output projection
@@ -408,11 +420,13 @@ class DirectionalInfluenceFunction(nn.Module):
         self.dropout = nn.Dropout(dropout)
         
         # Sparsity-promoting mask (learnable)
+        # Keep the historical module name and parameter indices so existing
+        # checkpoints remain loadable. Sigmoid is applied explicitly in forward
+        # so both pre-normalization logits and probabilities can be supervised.
         self.sparsity_gate = nn.Sequential(
             nn.Linear(feature_dim * 2, feature_dim // 2),
             nn.ReLU(),
             nn.Linear(feature_dim // 2, 1),
-            nn.Sigmoid()
         )
         
         self._reset_parameters()
@@ -423,6 +437,30 @@ class DirectionalInfluenceFunction(nn.Module):
         nn.init.xavier_uniform_(self.value_proj.weight)
         nn.init.xavier_uniform_(self.out_proj.weight)
         nn.init.zeros_(self.directional_bias_proj.weight)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Older checkpoints contained a per-head scalar that had no numerical
+        # effect because softmax cancels a constant shift. Silently discard only
+        # that known legacy key so strict loading remains otherwise strict.
+        state_dict.pop(prefix + 'direction_bias', None)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
     
     @staticmethod
     def _default_positions(
@@ -454,7 +492,8 @@ class DirectionalInfluenceFunction(nn.Module):
             spatial_positions: [B, N, 2] normalized coordinates for directional bias
             
         Returns:
-            influence_matrix: [B, N, N] directed influence weights G(p_i → p_j)
+            influence_matrix: [B, N, N] directed influence weights. Element
+                ``[b, i, j]`` is the edge ``source i → target j``.
             output_field: [B, N, C] updated field after influence aggregation
         """
         if field.dim() == 4:
@@ -480,21 +519,21 @@ class DirectionalInfluenceFunction(nn.Module):
         # Compute attention scores (influence strength)
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)  # [B, H, N, N]
         
-        # Add a learned bias from signed relative coordinates. The scalar
-        # head bias is kept for compatibility, while the relative-coordinate
-        # branch makes the bias genuinely directional.
-        delta = spatial_positions.unsqueeze(2) - spatial_positions.unsqueeze(1)  # [B, N, N, 2]
+        # Signed displacement from source i to target j. This pair-dependent
+        # quantity can distinguish i→j from j→i; a per-head scalar cannot.
+        delta = spatial_positions.unsqueeze(1) - spatial_positions.unsqueeze(2)  # [B, N, N, 2]
         distance = torch.norm(delta, dim=-1, keepdim=True)
         directional_features = torch.cat([delta, distance], dim=-1)
         directional_bias = self.directional_bias_proj(directional_features).permute(0, 3, 1, 2)
-        scores = scores + self.direction_bias + directional_bias
+        scores = scores + directional_bias
         
         # Apply sparsity gate based on feature concatenation
         field_expanded_i = field.unsqueeze(2).expand(-1, -1, N, -1)  # [B, N, N, C]
         field_expanded_j = field.unsqueeze(1).expand(-1, N, -1, -1)  # [B, N, N, C]
         field_pair = torch.cat([field_expanded_i, field_expanded_j], dim=-1)  # [B, N, N, 2C]
         
-        sparsity_weight = self.sparsity_gate(field_pair).squeeze(-1)  # [B, N, N]
+        sparsity_gate_logits = self.sparsity_gate(field_pair).squeeze(-1)  # [B, N, N]
+        sparsity_weight = torch.sigmoid(sparsity_gate_logits)
         
         # Combine attention with sparsity
         influence = torch.softmax(scores, dim=-1)  # [B, H, N, N]
@@ -510,8 +549,9 @@ class DirectionalInfluenceFunction(nn.Module):
             sparse = torch.zeros_like(influence_matrix).scatter_(-1, indices, values)
             influence_matrix = sparse / (sparse.sum(dim=-1, keepdim=True) + 1e-8)
         
-        # Aggregate values using influence
-        output = torch.matmul(influence, V)  # [B, H, N, D]
+        # Aggregate source values at each target with the same, gated graph used
+        # by propagation. For G[source, target], target states are Gᵀ @ V.
+        output = torch.einsum('bij,bhid->bhjd', influence_matrix, V)
         output = output.transpose(1, 2).reshape(B, N, C)  # [B, N, C]
         output = self.out_proj(output)
         output = self.dropout(output)
@@ -522,6 +562,7 @@ class DirectionalInfluenceFunction(nn.Module):
                 'output_field': output,
                 'head_attention': influence,
                 'sparsity_gate': sparsity_weight,
+                'sparsity_gate_logits': sparsity_gate_logits,
                 'directional_bias': directional_bias,
             }
         return influence_matrix, output
@@ -601,14 +642,24 @@ class CausalPropagation(nn.Module):
         
         trajectory = [field]
         influence_matrices = []
+        sparsity_gates = []
+        sparsity_gate_logits = []
         refinement_trajectory = []
         current_field = field
         alpha = torch.sigmoid(self.mix_logit)
         
         for step in range(steps):
             # Compute influence and propagate
-            influence_matrix, influence_field = self.influence_fn(current_field, spatial_positions=spatial_positions)
+            influence_components = self.influence_fn(
+                current_field,
+                spatial_positions=spatial_positions,
+                return_components=True,
+            )
+            influence_matrix = influence_components['influence_matrix']
+            influence_field = influence_components['output_field']
             influence_matrices.append(influence_matrix)
+            sparsity_gates.append(influence_components['sparsity_gate'])
+            sparsity_gate_logits.append(influence_components['sparsity_gate_logits'])
             refinement_trajectory.append(influence_field)
             
             # Propagate: F^{t+1} = G^T · F^t (with residual)
@@ -628,6 +679,8 @@ class CausalPropagation(nn.Module):
                 'field': final_field,
                 'trajectory': [maybe_reshape(state) for state in trajectory],
                 'influence_matrices': influence_matrices,
+                'sparsity_gates': sparsity_gates,
+                'sparsity_gate_logits': sparsity_gate_logits,
                 'refinement_trajectory': [maybe_reshape(state) for state in refinement_trajectory],
                 'mixing_alpha': alpha,
             }
@@ -854,7 +907,7 @@ class InterventionModule(nn.Module):
 
 
 class MultimodalCausalField(nn.Module):
-    """Complete MetaCausalField module integrating all components.
+    """InfluenceField prototype integrating the core neural components.
     
     This is the main interface that combines:
     1. Visual feature extraction (from pretrained encoder)
@@ -863,7 +916,8 @@ class MultimodalCausalField(nn.Module):
     4. Causal propagation
     5. Language-conditioned readout
     
-    Replaces the three-stage MLLM-CD pipeline with a unified end-to-end system.
+    This class is the compatibility-preserving implementation behind the public
+    ``MultimodalCausalField`` name used by existing checkpoints and scripts.
     """
     
     def __init__(self,
@@ -882,7 +936,10 @@ class MultimodalCausalField(nn.Module):
         self.visual_encoder = visual_encoder
         
         # Field construction
-        self.interpolation = GaussianInterpolation(sigma=config.gaussian_sigma)
+        self.interpolation = GaussianInterpolation(
+            sigma=config.gaussian_sigma,
+            sigma_in_grid_units=config.gaussian_sigma_in_grid_units,
+        )
         
         # Feature projection to causal field space
         self.field_projection = nn.Sequential(
@@ -961,7 +1018,12 @@ class MultimodalCausalField(nn.Module):
         influence_matrix: torch.Tensor,
         factor_attention: Optional[torch.Tensor],
     ) -> Optional[torch.Tensor]:
-        """Aggregate patch-level influence G into factor-level A^T G A."""
+        """Aggregate patch-level influence into a source→target factor graph.
+
+        ``factor_attention[f, i]`` localizes factor ``f`` at position ``i``.
+        Because ``influence_matrix[i, j]`` means position ``i`` influences
+        position ``j``, the returned matrix also follows ``[source, target]``.
+        """
         if factor_attention is None:
             return None
         factor_matrix = torch.bmm(
@@ -1038,7 +1100,12 @@ class MultimodalCausalField(nn.Module):
         x_query = torch.linspace(0, 1, W, device=device)
         yy, xx = torch.meshgrid(y_query, x_query, indexing='ij')
         query_positions = torch.stack([xx, yy], dim=-1).reshape(1, H * W, 2).expand(B, -1, -1)
-        field = self.interpolation(projected, patch_positions, query_positions=query_positions)
+        field = self.interpolation(
+            projected,
+            patch_positions,
+            query_positions=query_positions,
+            query_grid_shape=(H, W),
+        )
         
         return field
     
@@ -1058,7 +1125,7 @@ class MultimodalCausalField(nn.Module):
         Returns:
             outputs: Dict containing:
                 - 'field': Final causal field [B, H, W, C]
-                - 'influence_matrix': Learned causal structure [B, N, N]
+                - 'influence_matrix': Directed structure candidate [B, N, N]
                 - 'readout': Output representation [B, C]
         """
         visual_features = self.encode_visual_input(visual_features)
@@ -1072,10 +1139,18 @@ class MultimodalCausalField(nn.Module):
         propagation_details = self.propagation(field, return_details=True)
         field_propagated = propagation_details['field']
         influence_matrices = propagation_details['influence_matrices']
+        sparsity_gates = propagation_details['sparsity_gates']
+        sparsity_gate_logits = propagation_details['sparsity_gate_logits']
         if influence_matrices:
             influence_matrix = influence_matrices[-1]
         else:
-            influence_matrix, _ = self.propagation.influence_fn(field_propagated.reshape(B, N, C))
+            influence_components = self.propagation.influence_fn(
+                field_propagated.reshape(B, N, C),
+                return_components=True,
+            )
+            influence_matrix = influence_components['influence_matrix']
+            sparsity_gates = [influence_components['sparsity_gate']]
+            sparsity_gate_logits = [influence_components['sparsity_gate_logits']]
         
         if language_tokens is None and input_ids is not None and self.text_encoder is not None:
             language_tokens = self.text_encoder(input_ids)
@@ -1121,6 +1196,8 @@ class MultimodalCausalField(nn.Module):
             'field': field_fused,
             'influence_matrix': influence_matrix,
             'influence_matrices': influence_matrices,
+            'sparsity_gates': sparsity_gates,
+            'sparsity_gate_logits': sparsity_gate_logits,
             'readout': output,
             'initial_field': field,
             'field_trajectory': propagation_details['trajectory'],
@@ -1134,6 +1211,68 @@ class MultimodalCausalField(nn.Module):
             outputs['factor_influence_matrix'] = factor_influence_matrix
         if lm_logits is not None:
             outputs['lm_logits'] = lm_logits
+        return outputs
+
+    def _greedy_decode(self, memory: torch.Tensor, max_new_tokens: int) -> torch.Tensor:
+        """Decode from BOS without exposing any reference-answer tokens.
+
+        The returned tensor excludes BOS and includes EOS when the model emits
+        it.  Finished rows are held at EOS while the rest of the batch continues.
+        """
+        if self.text_decoder is None:
+            raise RuntimeError("Text generation requires enable_language=True.")
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be at least 1.")
+
+        max_new_tokens = min(int(max_new_tokens), self.config.max_text_length - 1)
+        batch_size = memory.shape[0]
+        generated = torch.full(
+            (batch_size, 1),
+            self.config.bos_token_id,
+            dtype=torch.long,
+            device=memory.device,
+        )
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=memory.device)
+        for _ in range(max_new_tokens):
+            logits = self.text_decoder(generated, memory)
+            next_token = logits[:, -1].argmax(dim=-1)
+            next_token = torch.where(
+                finished,
+                torch.full_like(next_token, self.config.eos_token_id),
+                next_token,
+            )
+            generated = torch.cat([generated, next_token.unsqueeze(1)], dim=1)
+            finished = finished | next_token.eq(self.config.eos_token_id)
+            if bool(finished.all()):
+                break
+        return generated[:, 1:]
+
+    @torch.no_grad()
+    def generate_text(
+        self,
+        visual_features: torch.Tensor,
+        language_tokens: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+        patch_positions: Optional[torch.Tensor] = None,
+        max_new_tokens: int = 32,
+    ) -> Dict[str, torch.Tensor]:
+        """Generate a factual response autoregressively from BOS.
+
+        ``input_ids`` condition the field as the question/prompt only; reference
+        answer IDs are intentionally not accepted by this API.
+        """
+        outputs = self.forward(
+            visual_features,
+            language_tokens=language_tokens,
+            input_ids=input_ids,
+            decoder_input_ids=None,
+            patch_positions=patch_positions,
+        )
+        B, H, W, C = outputs['field'].shape
+        outputs['generated_ids'] = self._greedy_decode(
+            outputs['field'].reshape(B, H * W, C),
+            max_new_tokens=max_new_tokens,
+        )
         return outputs
     
     def counterfactual_forward(self,
@@ -1333,6 +1472,34 @@ class MultimodalCausalField(nn.Module):
             outputs['lm_logits_counterfactual'] = lm_logits_counterfactual
         return outputs
 
+    @torch.no_grad()
+    def generate_counterfactual_text(
+        self,
+        visual_features: torch.Tensor,
+        intervention_type: str,
+        intervention_params: Dict,
+        language_tokens: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+        num_rollout_steps: int = 5,
+        max_new_tokens: int = 32,
+    ) -> Dict[str, torch.Tensor]:
+        """Generate a counterfactual response without reference-answer prefixes."""
+        outputs = self.counterfactual_forward(
+            visual_features,
+            intervention_type=intervention_type,
+            intervention_params=intervention_params,
+            language_tokens=language_tokens,
+            input_ids=input_ids,
+            decoder_input_ids=None,
+            num_rollout_steps=num_rollout_steps,
+        )
+        B, H, W, C = outputs['field_counterfactual'].shape
+        outputs['generated_ids_counterfactual'] = self._greedy_decode(
+            outputs['field_counterfactual'].reshape(B, H * W, C),
+            max_new_tokens=max_new_tokens,
+        )
+        return outputs
+
 
 # ==============================================================================
 # Loss Functions for MetaCausalField Training
@@ -1433,35 +1600,167 @@ class MetaCausalLoss(nn.Module):
 
     def _field_smoothness(self, field: torch.Tensor) -> torch.Tensor:
         if field.dim() == 4:
-            grad_h = field[:, 1:, :, :] - field[:, :-1, :, :]
-            grad_w = field[:, :, 1:, :] - field[:, :, :-1, :]
-            return (grad_h ** 2).mean() + (grad_w ** 2).mean()
+            terms = []
+            if field.shape[1] > 1:
+                grad_h = field[:, 1:, :, :] - field[:, :-1, :, :]
+                terms.append((grad_h ** 2).mean())
+            if field.shape[2] > 1:
+                grad_w = field[:, :, 1:, :] - field[:, :, :-1, :]
+                terms.append((grad_w ** 2).mean())
+            return sum(terms) if terms else field.sum() * 0.0
         if field.dim() == 3:
             B, N, C = field.shape
             H = int(math.sqrt(N))
             if H * H == N:
                 return self._field_smoothness(field.reshape(B, H, H, C))
         return torch.zeros((), device=field.device, dtype=field.dtype)
+
+    @staticmethod
+    def _normalized_row_entropy(matrix: torch.Tensor) -> torch.Tensor:
+        """Entropy proxy for sparsity when only normalized edges are available.
+
+        An L1 penalty is constant for a non-negative row-stochastic matrix. Low
+        row entropy, in contrast, rewards concentrating outgoing mass on fewer
+        targets and remains useful for legacy callers that only provide ``G``.
+        """
+        weights = matrix.abs()
+        probabilities = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        entropy = -(probabilities * probabilities.clamp_min(1e-8).log()).sum(dim=-1)
+        num_targets = matrix.shape[-1]
+        if num_targets > 1:
+            entropy = entropy / math.log(num_targets)
+        return entropy.mean()
+
+    @classmethod
+    def _gate_sparsity(cls, gate: torch.Tensor) -> torch.Tensor:
+        """L0-style gate cost plus selectivity of pre-normalization gates.
+
+        ``gate`` contains sigmoid probabilities before edge-row
+        renormalization. The mean is an expected open-edge count proxy, while
+        normalized entropy prevents the loss from being reduced solely by a
+        uniform rescaling of every gate in a row.
+        """
+        gate = gate.clamp(0.0, 1.0)
+        return gate.mean() + cls._normalized_row_entropy(gate)
+
+    @staticmethod
+    def factor_localization_loss(
+        factor_attention: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        """Supervise factor-to-position attention with indices or soft masks.
+
+        Args:
+            factor_attention: ``[B, F, N]`` probability distributions.
+            targets: Either integer position indices ``[B, F]`` (``-100`` is
+                ignored), or non-negative masks/distributions shaped
+                ``[B, F, N]`` or ``[B, F, H, W]``. All-zero masks are ignored.
+        """
+        targets = targets.to(device=factor_attention.device)
+        if targets.dim() == 2 and not targets.is_floating_point():
+            valid = targets.ne(-100)
+            if not valid.any():
+                return factor_attention.sum() * 0.0
+            return F.nll_loss(
+                factor_attention.clamp_min(1e-8).log().reshape(-1, factor_attention.shape[-1]),
+                targets.reshape(-1).long(),
+                ignore_index=-100,
+            )
+
+        if targets.dim() == 4:
+            targets = targets.flatten(start_dim=2)
+        if targets.shape != factor_attention.shape:
+            raise ValueError(
+                "factor_spatial_targets must be [B,F], [B,F,N], or [B,F,H,W]; "
+                f"got {tuple(targets.shape)} for attention {tuple(factor_attention.shape)}"
+            )
+
+        targets = targets.to(device=factor_attention.device, dtype=factor_attention.dtype)
+        finite = torch.isfinite(targets)
+        targets = torch.where(finite, targets.clamp_min(0.0), torch.zeros_like(targets))
+        mass = targets.sum(dim=-1, keepdim=True)
+        valid = mass.squeeze(-1) > 0
+        if not valid.any():
+            return factor_attention.sum() * 0.0
+        target_distribution = targets / mass.clamp_min(1e-8)
+        cross_entropy = -(
+            target_distribution * factor_attention.clamp_min(1e-8).log()
+        ).sum(dim=-1)
+        return cross_entropy[valid].mean()
+
+    @staticmethod
+    def factor_graph_loss(
+        factor_graph: torch.Tensor,
+        targets: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Supervise a factor graph under the ``[source, target]`` convention.
+
+        Both prediction and target are row-normalized so binary adjacencies and
+        soft edge strengths are comparable. Target rows without an outgoing
+        edge are ignored because a row-stochastic patch graph cannot represent
+        an absorbing/no-outgoing row without an explicit null node.
+        """
+        targets = targets.to(device=factor_graph.device, dtype=factor_graph.dtype)
+        if targets.shape != factor_graph.shape:
+            raise ValueError(
+                f"factor_graph_targets must have shape {tuple(factor_graph.shape)}, "
+                f"got {tuple(targets.shape)}"
+            )
+
+        finite = torch.isfinite(targets)
+        targets = torch.where(finite, targets.clamp_min(0.0), torch.zeros_like(targets))
+        prediction = factor_graph.clamp_min(0.0)
+        num_factors = prediction.shape[-1]
+        off_diagonal = ~torch.eye(
+            num_factors,
+            device=prediction.device,
+            dtype=torch.bool,
+        ).view(1, num_factors, num_factors)
+        prediction = prediction.masked_fill(~off_diagonal, 0.0)
+        targets = targets.masked_fill(~off_diagonal, 0.0)
+
+        target_mass = targets.sum(dim=-1, keepdim=True)
+        prediction = prediction / prediction.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        targets = targets / target_mass.clamp_min(1e-8)
+        valid = finite & off_diagonal & (target_mass > 0)
+        if mask is not None:
+            valid = valid & mask.to(device=valid.device, dtype=torch.bool)
+        if not valid.any():
+            return factor_graph.sum() * 0.0
+        return F.smooth_l1_loss(prediction[valid], targets[valid])
     
     def structure_regularization(self,
                                   influence_matrix: torch.Tensor,
-                                  field: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                                  field: torch.Tensor,
+                                  sparsity_source: Optional[torch.Tensor] = None,
+                                  ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Structure regularization losses.
         
-        Sparsity: L1 penalty on influence matrix (encourages sparse causal structure)
+        Sparsity: L0/entropy proxy on pre-normalization gates. If gates are not
+            available, normalized row entropy is used for backward compatibility.
         Smoothness: Gradient penalty on field (encourages spatial continuity)
         
         L_reg = λ_1 |G|_1 + λ_2 |∇F|²
         """
-        if isinstance(influence_matrix, (list, tuple)):
-            matrices = [m for m in influence_matrix if m is not None]
-            if matrices:
-                sparsity_loss = torch.stack([m.abs().mean() for m in matrices]).mean()
+        if sparsity_source is not None:
+            gates = sparsity_source if isinstance(sparsity_source, (list, tuple)) else [sparsity_source]
+            gates = [gate for gate in gates if gate is not None]
+            if gates:
+                sparsity_loss = torch.stack([self._gate_sparsity(gate) for gate in gates]).mean()
             else:
                 device = field[0].device if isinstance(field, (list, tuple)) else field.device
                 sparsity_loss = torch.zeros((), device=device)
         else:
-            sparsity_loss = influence_matrix.abs().mean()
+            matrices = influence_matrix if isinstance(influence_matrix, (list, tuple)) else [influence_matrix]
+            matrices = [matrix for matrix in matrices if matrix is not None]
+            if matrices:
+                sparsity_loss = torch.stack([
+                    self._normalized_row_entropy(matrix) for matrix in matrices
+                ]).mean()
+            else:
+                device = field[0].device if isinstance(field, (list, tuple)) else field.device
+                sparsity_loss = torch.zeros((), device=device)
 
         if isinstance(field, (list, tuple)):
             states = [state for state in field if state is not None]
@@ -1497,7 +1796,24 @@ class MetaCausalLoss(nn.Module):
         if 'factor_logits' in outputs and 'factor_targets' in targets:
             logits = outputs['factor_logits'].reshape(-1, self.config.num_factor_classes)
             factor_targets = targets['factor_targets'].reshape(-1).long()
-            losses['factor'] = F.cross_entropy(logits, factor_targets, ignore_index=-100)
+            if factor_targets.ne(-100).any():
+                losses['factor'] = F.cross_entropy(logits, factor_targets, ignore_index=-100)
+
+        # Optional localization/graph supervision gives the factor localizer a
+        # direct training signal. Without one of these targets, factor outputs
+        # remain descriptive and are not claimed as identified structure.
+        if 'factor_spatial_attention' in outputs and 'factor_spatial_targets' in targets:
+            losses['factor_localization'] = self.factor_localization_loss(
+                outputs['factor_spatial_attention'],
+                targets['factor_spatial_targets'],
+            )
+
+        if 'factor_influence_matrix' in outputs and 'factor_graph_targets' in targets:
+            losses['factor_graph'] = self.factor_graph_loss(
+                outputs['factor_influence_matrix'],
+                targets['factor_graph_targets'],
+                targets.get('factor_graph_mask'),
+            )
         
         # Causal consistency
         if 'field_env1' in outputs and 'field_env2' in outputs:
@@ -1517,9 +1833,13 @@ class MetaCausalLoss(nn.Module):
             )
 
         if 'score_counterfactual' in outputs and 'cf_score_targets' in targets:
-            losses['counterfactual_score'] = F.mse_loss(
-                outputs['score_counterfactual'], targets['cf_score_targets'].float()
-            )
+            cf_score_targets = targets['cf_score_targets'].float()
+            valid_cf_scores = torch.isfinite(cf_score_targets)
+            if valid_cf_scores.any():
+                losses['counterfactual_score'] = F.mse_loss(
+                    outputs['score_counterfactual'][valid_cf_scores],
+                    cf_score_targets[valid_cf_scores],
+                )
 
         if 'lm_logits_counterfactual' in outputs and 'cf_lm_targets' in targets:
             losses['counterfactual_lm'] = F.cross_entropy(
@@ -1533,7 +1853,9 @@ class MetaCausalLoss(nn.Module):
         field_for_reg = outputs.get('field_trajectory', outputs.get('field'))
         if influence_for_reg is not None and field_for_reg is not None:
             sparsity, smoothness = self.structure_regularization(
-                influence_for_reg, field_for_reg
+                influence_for_reg,
+                field_for_reg,
+                sparsity_source=outputs.get('sparsity_gates'),
             )
             losses['sparsity'] = sparsity
             losses['smoothness'] = smoothness
@@ -1542,6 +1864,8 @@ class MetaCausalLoss(nn.Module):
         total = losses.get('lm', 0) + \
                 losses.get('score', 0) + \
                 losses.get('factor', 0) + \
+                self.config.lambda_factor_localization * losses.get('factor_localization', 0) + \
+                self.config.lambda_factor_graph * losses.get('factor_graph', 0) + \
                 self.lambda_consistency * losses.get('consistency', 0) + \
                 self.lambda_counterfactual * losses.get('counterfactual', 0) + \
                 self.lambda_counterfactual * losses.get('counterfactual_score', 0) + \
@@ -1563,7 +1887,7 @@ def extract_causal_graph(influence_matrix: torch.Tensor,
     """Extract discrete causal graph from continuous influence matrix.
     
     Args:
-        influence_matrix: [N, N] influence weights
+        influence_matrix: [N, N] influence weights in ``[source, target]`` order
         threshold: Minimum influence to consider as edge
         
     Returns:
@@ -1588,14 +1912,14 @@ def compute_causal_effects(field: torch.Tensor,
     
     Args:
         field: [N, C] field state
-        influence_matrix: [N, N] influence weights
+        influence_matrix: [N, N] influence weights in ``[source, target]`` order
         intervention_position: Index of intervened position
         
     Returns:
         effects: [N] causal effect strength at each position
     """
     # Effect is the accumulated influence from intervention position
-    effects = influence_matrix[:, intervention_position]  # [N]
+    effects = influence_matrix[intervention_position, :]  # [N] targets reached by the source
     
     # Normalize
     effects = effects / (effects.sum() + 1e-8)
@@ -1647,8 +1971,8 @@ def visualize_causal_field(field: torch.Tensor,
     if influence_matrix is not None:
         im3 = axes[2].imshow(influence_matrix.cpu().numpy(), cmap='Blues')
         axes[2].set_title('Causal Influence Matrix')
-        axes[2].set_xlabel('From Position')
-        axes[2].set_ylabel('To Position')
+        axes[2].set_xlabel('To Position (target)')
+        axes[2].set_ylabel('From Position (source)')
         plt.colorbar(im3, ax=axes[2])
     
     plt.tight_layout()

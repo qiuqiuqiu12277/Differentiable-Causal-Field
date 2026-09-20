@@ -10,13 +10,15 @@ from pathlib import Path
 import torch
 
 from evaluate_metacausal_field import load_model
-from train_metacausal_field import prepare_metadata
 
 
 def measure_latency(checkpoint: str, k: int, device: str, repeats: int = 20):
     torch_device = torch.device(device if torch.cuda.is_available() and device != "cpu" else "cpu")
-    model, _, _, _, _ = load_model(checkpoint, torch_device)
-    model.propagation.num_steps = k
+    model, _, _, _, _ = load_model(
+        checkpoint,
+        torch_device,
+        num_propagation_steps=k,
+    )
     model.eval()
     dummy = torch.randn(1, 49, model.config.feature_dim, device=torch_device)
     with torch.no_grad():
@@ -62,11 +64,11 @@ def main():
             args.device,
             "--batch_size",
             str(args.batch_size),
+            "--num_propagation_steps",
+            str(k),
         ]
         if args.feature_cache:
             cmd.extend(["--feature_cache", args.feature_cache])
-        if k == 0:
-            cmd.append("--disable_propagation")
         subprocess.run(cmd, check=True)
         with open(output) as f:
             metrics = json.load(f)

@@ -37,7 +37,8 @@ def flatten_row(dataset: str, method: str, metrics: dict):
 
 def main():
     parser = argparse.ArgumentParser(description="Reproduce MAG/Lung tables")
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--mag_checkpoint", required=True)
+    parser.add_argument("--lung_checkpoint", required=True)
     parser.add_argument("--output_dir", default="./paper_table_outputs")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch_size", type=int, default=8)
@@ -46,8 +47,9 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     rows = []
+    checkpoints = {"MAG9": args.mag_checkpoint, "Lung": args.lung_checkpoint}
     for dataset in ["MAG9", "Lung"]:
-        result = run_dataset(dataset, args.checkpoint, output_dir, args.device, args.batch_size)
+        result = run_dataset(dataset, checkpoints[dataset], output_dir, args.device, args.batch_size)
         rows.append(flatten_row(dataset, "FCI", result["structure_learning"]["metrics_fci"]))
         if "metrics_field" in result["structure_learning"]:
             rows.append(flatten_row(dataset, "MetaCausalField", result["structure_learning"]["metrics_field"]))

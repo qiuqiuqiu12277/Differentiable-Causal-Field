@@ -1,0 +1,4 @@
+# Reproducible entry point for the local prototype and tests.
+# Large benchmark integrations are optional; install them with:
+#   python -m pip install -e '.[benchmarks]'
+-e .[data,dev]

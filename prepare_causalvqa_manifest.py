@@ -12,6 +12,7 @@ import argparse
 import csv
 import hashlib
 import json
+import random
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
@@ -48,9 +49,85 @@ def resolve_path(value, root: Path):
     return str(root / text)
 
 
-def split_for(sample_id: str, test_fraction: float) -> str:
-    value = int(hashlib.sha256(sample_id.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
-    return "test" if value < test_fraction else "train"
+SPLIT_ALIASES = {
+    "train": "train",
+    "val": "val",
+    "valid": "val",
+    "validation": "val",
+    "dev": "val",
+    "test": "test",
+    "eval": "test",
+    "evaluation": "test",
+}
+
+
+def assign_group_splits(
+    records: List[Dict[str, Any]],
+    *,
+    train_fraction: float = 0.7,
+    val_fraction: float = 0.15,
+    seed: int = 42,
+) -> List[Dict[str, Any]]:
+    """Assign deterministic train/val/test labels at media-group level."""
+    if not 0 < train_fraction < 1 or not 0 < val_fraction < 1:
+        raise ValueError("train_fraction and val_fraction must be between 0 and 1")
+    if train_fraction + val_fraction >= 1:
+        raise ValueError("train_fraction + val_fraction must leave a test fraction")
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for record in records:
+        group_id = str(record.get("group_id") or record["sample_id"])
+        groups.setdefault(group_id, []).append(record)
+    if len(groups) < 3:
+        raise ValueError(
+            "At least three distinct video/scene/media groups are required for "
+            "non-empty train/val/test splits."
+        )
+
+    assigned: Dict[str, str] = {}
+    for group_id, group_records in groups.items():
+        labels = {
+            SPLIT_ALIASES.get(str(record.get("split", "")).strip().lower(), "")
+            for record in group_records
+            if str(record.get("split", "")).strip()
+        }
+        if "" in labels:
+            raw = sorted({str(record.get("split")) for record in group_records})
+            raise ValueError(f"Unsupported explicit split label in group {group_id!r}: {raw}")
+        if len(labels) > 1:
+            raise ValueError(
+                f"Group {group_id!r} spans explicit splits {sorted(labels)}; this leaks shared media."
+            )
+        if labels:
+            assigned[group_id] = next(iter(labels))
+
+    unassigned = sorted(set(groups) - set(assigned))
+    random.Random(seed).shuffle(unassigned)
+    n_groups = len(groups)
+    targets = {
+        "train": max(1, int(round(n_groups * train_fraction))),
+        "val": max(1, int(round(n_groups * val_fraction))),
+    }
+    if targets["train"] + targets["val"] >= n_groups:
+        overflow = targets["train"] + targets["val"] - (n_groups - 1)
+        targets["train"] = max(1, targets["train"] - overflow)
+    targets["test"] = n_groups - targets["train"] - targets["val"]
+
+    counts = {name: sum(label == name for label in assigned.values()) for name in targets}
+    for group_id in unassigned:
+        deficits = {name: targets[name] - counts[name] for name in targets}
+        label = max(("train", "val", "test"), key=lambda name: (deficits[name], -counts[name]))
+        assigned[group_id] = label
+        counts[label] += 1
+
+    if any(counts[name] == 0 for name in ("train", "val", "test")):
+        raise ValueError(
+            "Explicit split assignments leave an empty partition and cannot be repaired "
+            "without moving an explicitly labelled media group."
+        )
+    for group_id, group_records in groups.items():
+        for record in group_records:
+            record["split"] = assigned[group_id]
+    return records
 
 
 def choices_from(row: Dict[str, Any]):
@@ -70,7 +147,8 @@ def record_from_flat(row: Dict[str, Any], root: Path, default_split: str, test_f
     if not sample_id:
         sample_id = hashlib.sha1(json.dumps(row, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:12]
 
-    split = str(row.get("split") or default_split or split_for(sample_id, test_fraction))
+    del test_fraction  # Retained in the call signature for compatibility.
+    split = str(row.get("split") or default_split or "")
     image_path = resolve_path(row.get("image_path") or row.get("image") or row.get("frame_path"), root)
     video_path = resolve_path(row.get("video_path") or row.get("video") or row.get("video_filename"), root)
     cf_image_path = resolve_path(
@@ -81,6 +159,16 @@ def record_from_flat(row: Dict[str, Any], root: Path, default_split: str, test_f
         row.get("counterfactual_video_path") or row.get("cf_video_path") or row.get("counterfactual_video"),
         root,
     )
+    group_id = str(
+        row.get("group_id")
+        or row.get("video_id")
+        or row.get("scene_id")
+        or row.get("clip_id")
+        or video_path
+        or image_path
+        or prefix
+        or sample_id
+    )
     intervention = parse_intervention(row.get("intervention"))
     if intervention is None:
         target = row.get("intervention_target", row.get("target", row.get("object_id")))
@@ -90,6 +178,7 @@ def record_from_flat(row: Dict[str, Any], root: Path, default_split: str, test_f
 
     return {
         "sample_id": sample_id,
+        "group_id": group_id,
         "split": split,
         "image_path": image_path,
         "video_path": video_path,
@@ -139,13 +228,31 @@ def main():
     parser.add_argument("--data_root", default=None)
     parser.add_argument("--output", required=True)
     parser.add_argument("--default_split", default="")
-    parser.add_argument("--test_fraction", type=float, default=0.2)
+    parser.add_argument("--train_fraction", type=float, default=0.7)
+    parser.add_argument("--val_fraction", type=float, default=0.15)
+    parser.add_argument("--test_fraction", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     input_path = Path(args.input)
     root = Path(args.data_root) if args.data_root else input_path.parent
     rows = read_rows(input_path)
-    records = flatten_rows(rows, root, args.default_split, args.test_fraction)
+    legacy_test_fraction = args.test_fraction
+    train_fraction = args.train_fraction
+    val_fraction = args.val_fraction
+    if legacy_test_fraction is not None:
+        if not 0 < legacy_test_fraction < 1:
+            raise ValueError("test_fraction must be between 0 and 1")
+        remaining = 1.0 - legacy_test_fraction
+        train_fraction = remaining * (args.train_fraction / (args.train_fraction + args.val_fraction))
+        val_fraction = remaining - train_fraction
+    records = flatten_rows(rows, root, args.default_split, legacy_test_fraction or 0.15)
+    records = assign_group_splits(
+        records,
+        train_fraction=train_fraction,
+        val_fraction=val_fraction,
+        seed=args.seed,
+    )
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
