@@ -17,4 +17,24 @@ jobs:
       - name: Install
         run: python -m pip install -e '.[data,dev]'
       - name: Test
-        run: pytest
+        shell: bash
+        run: |
+          set +e
+          python -m pytest 2>&1 | tee "$RUNNER_TEMP/pytest.log"
+          test_status=${PIPESTATUS[0]}
+
+          # Keep a useful failure summary on the check run. Public Actions logs
+          # require an authenticated session, while check annotations remain
+          # visible to contributors who are diagnosing a failed pull request.
+          if (( test_status != 0 )); then
+            PYTEST_LOG="$RUNNER_TEMP/pytest.log" python - <<'PY'
+          import os
+          from pathlib import Path
+
+          text = Path(os.environ["PYTEST_LOG"]).read_text(errors="replace")[-12_000:]
+          escaped = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print(f"::error title=pytest failed::{escaped}")
+          PY
+          fi
+
+          exit "$test_status"
