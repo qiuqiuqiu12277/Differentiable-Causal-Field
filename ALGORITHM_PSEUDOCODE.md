@@ -1,6 +1,14 @@
+# Legacy prototype pseudocode
+
+> **Status:** This document describes the earlier `MetaCausalField` prototype,
+> not the complete InfluenceField paper algorithm. It is retained for code
+> archaeology only. For the maintained project scope and paper link, start with
+> [README.md](README.md) and [REPRODUCIBILITY.md](REPRODUCIBILITY.md).
+
 # Algorithm Pseudocode for MetaCausalField
 
-This document provides formal algorithmic descriptions for the key components of MetaCausalField, as presented in the paper (Section 3).
+This document records pseudocode for the earlier MetaCausalField prototype. It
+must not be read as a transcription of the current InfluenceField paper.
 
 ---
 

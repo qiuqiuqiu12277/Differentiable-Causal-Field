@@ -156,6 +156,8 @@ def multiple_choice_match(pred: str, gold: str, choices: Optional[List[str]] = N
 
 
 def answer_correct(pred: str, gold: str, choices: Optional[List[str]] = None) -> bool:
+    if not normalize_answer(gold):
+        raise ValueError("Cannot score an example with an empty gold answer.")
     return multiple_choice_match(pred, gold, choices)
 
 
@@ -216,10 +218,15 @@ def bbox_iou(pred_box: Sequence[float], gold_box: Sequence[float]) -> float:
 def causal_localization_iou(pred_boxes: List[Sequence[float]], gold_boxes: List[Sequence[float]]) -> float:
     if not pred_boxes or not gold_boxes:
         return math.nan
-    scores = []
-    for gold in gold_boxes:
-        scores.append(max(bbox_iou(pred, gold) for pred in pred_boxes))
-    return float(np.mean(scores))
+    if len(pred_boxes) != len(gold_boxes):
+        raise ValueError(
+            "Localization boxes must be paired per sample; got "
+            f"{len(pred_boxes)} predictions and {len(gold_boxes)} gold boxes."
+        )
+    return float(np.mean([
+        bbox_iou(prediction, gold)
+        for prediction, gold in zip(pred_boxes, gold_boxes)
+    ]))
 
 
 def key_object_identification_accuracy(records: List[Dict]) -> float:

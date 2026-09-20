@@ -13,9 +13,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -30,14 +29,54 @@ from causal_metrics import (
     answer_correct,
     counterfactual_consistency,
     factor_influence_to_edges,
-    influence_to_edges,
     ood_metrics,
     qa_category_accuracy,
     structure_metrics,
 )
 from evaluate_metacausal_field import load_model
-from metacausal_field import SimpleTokenizer
-from train_metacausal_field import collate, find_counterfactual_file, scenario_directions, scenario_positions
+from train_metacausal_field import (
+    collate,
+    intervention_tensors,
+    is_explicit_modify_intervention,
+    set_global_seed,
+)
+
+
+def strict_sample_partitions(samples):
+    """Return disjoint train/val/test lists and reject ambiguous protocols."""
+    aliases = {"validation": "val", "dev": "val", "eval": "test"}
+    partitions = {"train": [], "val": [], "test": []}
+    for sample in samples:
+        label = aliases.get(str(sample.split).strip().lower(), str(sample.split).strip().lower())
+        if label not in partitions:
+            raise ValueError(
+                f"Sample {sample.sample_id!r} has unsupported split {sample.split!r}; "
+                "expected train, val, or test."
+            )
+        partitions[label].append(sample)
+    if not partitions["train"] or not partitions["test"]:
+        raise ValueError("The pipeline requires non-empty, explicit train and test partitions.")
+
+    def leakage_keys(sample):
+        values = {
+            sample.group_id,
+            sample.video_path,
+            sample.image_path,
+            sample.counterfactual_video_path,
+            sample.counterfactual_image_path,
+        }
+        return {str(value) for value in values if value} or {str(sample.sample_id)}
+
+    group_sets = {
+        name: set().union(*(leakage_keys(sample) for sample in rows))
+        for name, rows in partitions.items()
+    }
+    for left, right in (("train", "val"), ("train", "test"), ("val", "test")):
+        overlap = group_sets[left] & group_sets[right]
+        if overlap:
+            preview = sorted(str(x) for x in overlap)[:3]
+            raise ValueError(f"Media/group leakage between {left} and {right}: {preview}")
+    return partitions["train"], partitions["val"], partitions["test"]
 
 
 def discover_factors_from_dataset(samples, min_variance: float = 1e-8) -> List[str]:
@@ -50,25 +89,25 @@ def discover_factors_from_dataset(samples, min_variance: float = 1e-8) -> List[s
     return discovered
 
 
-def learn_structure_fci(samples, factors: List[str]) -> List[Tuple[str, str]]:
+def learn_structure_fci(samples, factors: List[str]) -> Tuple[List[Tuple[str, str]], str]:
     rows = []
     for sample in samples:
         if sample.factors:
             rows.append([sample.factors.get(name, 0.0) for name in factors])
     if len(rows) < 3 or len(factors) < 2:
-        return []
+        return [], "unavailable_insufficient_training_data"
     data = np.asarray(rows, dtype=float)
     try:
         from causallearn.search.ConstraintBased.FCI import fci
         graph, _ = fci(data, alpha=0.05, independence_test_method="kci", verbose=False)
-    except Exception:
+    except Exception as exc:
         corr = np.corrcoef(data, rowvar=False)
         edges = []
         for i in range(len(factors)):
             for j in range(len(factors)):
                 if i != j and abs(corr[i, j]) > 0.25:
                     edges.append((factors[i], factors[j]))
-        return edges
+        return edges, f"correlation_smoke_fallback:{type(exc).__name__}"
 
     from causallearn.graph.Endpoint import Endpoint
     edges = []
@@ -96,7 +135,7 @@ def learn_structure_fci(samples, factors: List[str]) -> List[Tuple[str, str]]:
                 # so downstream ESHD penalizes uncertainty without dropping signal.
                 edges.append((factors[i], factors[j]))
                 edges.append((factors[j], factors[i]))
-    return edges
+    return edges, "fci"
 
 
 def gold_edges_from_samples(samples) -> List[Tuple[str, str]]:
@@ -143,7 +182,16 @@ def encode_model_visual(model, cached_backbone, batch, device):
     return {"visual_features": model.visual_encoder(batch["image"].to(device))}
 
 
-def run_model_records(args, samples, model, tokenizer, factor_names, device, cached_backbone=None):
+def run_model_records(
+    args,
+    samples,
+    model,
+    tokenizer,
+    factor_names,
+    device,
+    cached_backbone=None,
+    factor_graph_supervised=False,
+):
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
@@ -155,23 +203,24 @@ def run_model_records(args, samples, model, tokenizer, factor_names, device, cac
         transform,
         factor_names=factor_names,
         num_video_frames=args.num_video_frames,
+        allow_missing_media=getattr(args, "allow_missing_media", False),
+        skip_media_loading=cached_backbone is not None,
     )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate)
     records = []
-    influence_edges = []
+    influence_edges = [] if factor_graph_supervised else None
     for batch in tqdm(loader, desc="Stage model inference"):
         input_ids = batch["input_ids"].to(device)
-        answer_ids = batch["answer_ids"].to(device)
         backbone_outputs = encode_model_visual(model, cached_backbone, batch, device)
-        outputs = model(
+        outputs = model.generate_text(
             backbone_outputs["visual_features"],
             language_tokens=backbone_outputs.get("language_tokens") if args.use_frozen_language_tokens else None,
             input_ids=input_ids,
-            decoder_input_ids=answer_ids[:, :-1],
+            max_new_tokens=args.generation_max_new_tokens,
         )
-        generated = outputs["lm_logits"].argmax(dim=-1).detach().cpu() if "lm_logits" in outputs else None
+        generated = outputs["generated_ids"].detach().cpu()
         for i in range(len(batch["sample_id"])):
-            pred_text = tokenizer.decode(generated[i]) if generated is not None else ""
+            pred_text = tokenizer.decode(generated[i])
             gold = batch["answer"][i]
             correct = answer_correct(pred_text, gold, batch["choices"][i] if "choices" in batch else None)
             records.append({
@@ -182,7 +231,11 @@ def run_model_records(args, samples, model, tokenizer, factor_names, device, cac
                 "gold": gold,
                 "correct": correct,
             })
-        if "factor_influence_matrix" in outputs and factor_names:
+        if factor_graph_supervised:
+            if "factor_influence_matrix" not in outputs or not factor_names:
+                raise RuntimeError(
+                    "Checkpoint declares factor-graph supervision but factor influence output is unavailable."
+                )
             influence_edges.extend(
                 factor_influence_to_edges(
                     outputs["factor_influence_matrix"],
@@ -191,15 +244,28 @@ def run_model_records(args, samples, model, tokenizer, factor_names, device, cac
                     top_k=args.factor_edge_top_k,
                 )
             )
-        else:
-            labels = factor_names or [f"p{i}" for i in range(outputs["influence_matrix"].shape[-1])]
-            influence_edges.extend(influence_to_edges(outputs["influence_matrix"], labels, threshold=args.edge_threshold))
     return records, influence_edges
 
 
 @torch.no_grad()
 def run_counterfactual_records(args, model, tokenizer, device, dataset_name: str, samples=None, factor_names=None, cached_backbone=None):
-    manifest_pairs = [s for s in (samples or []) if s.cf_answer]
+    del dataset_name
+    # A counterfactual answer without an explicit intervention is not an
+    # auditable pair: hashing a scenario name into a field edit would measure a
+    # synthetic plumbing heuristic, not counterfactual reasoning.
+    manifest_pairs = [
+        sample
+        for sample in (samples or [])
+        if sample.answer
+        and sample.cf_answer
+        and is_explicit_modify_intervention(
+            sample.intervention,
+            feature_dim=model.config.feature_dim,
+            require_position=True,
+        )
+    ]
+    if args.max_counterfactual_pairs:
+        manifest_pairs = manifest_pairs[:args.max_counterfactual_pairs]
     if manifest_pairs:
         transform = transforms.Compose([
             transforms.Resize((224, 224)),
@@ -213,6 +279,8 @@ def run_counterfactual_records(args, model, tokenizer, device, dataset_name: str
                 transform,
                 factor_names=factor_names,
                 num_video_frames=args.num_video_frames,
+                allow_missing_media=getattr(args, "allow_missing_media", False),
+                skip_media_loading=cached_backbone is not None,
             ),
             batch_size=args.batch_size,
             shuffle=False,
@@ -221,32 +289,36 @@ def run_counterfactual_records(args, model, tokenizer, device, dataset_name: str
         records = []
         for batch in tqdm(loader, desc="Manifest counterfactual"):
             input_ids = batch["input_ids"].to(device)
-            answer_ids = batch["answer_ids"].to(device)
             backbone_outputs = encode_model_visual(model, cached_backbone, batch, device)
             visual = backbone_outputs["visual_features"]
             language_tokens = backbone_outputs.get("language_tokens") if args.use_frozen_language_tokens else None
-            factual = model(
+            factual = model.generate_text(
                 visual,
                 language_tokens=language_tokens,
                 input_ids=input_ids,
-                decoder_input_ids=answer_ids[:, :-1],
+                max_new_tokens=args.generation_max_new_tokens,
             )
-            factual_ids = factual.get("lm_logits").argmax(dim=-1).cpu()
-            cf_ids = torch.tensor([tokenizer.encode(x) for x in batch["cf_answer"]], dtype=torch.long, device=device)
-            cf_outputs = model.counterfactual_forward(
+            factual_ids = factual["generated_ids"].cpu()
+            positions, directions = intervention_tensors(
+                batch["intervention"],
+                batch["sample_id"],
+                model.config.feature_dim,
+                device,
+            )
+            cf_outputs = model.generate_counterfactual_text(
                 visual,
                 intervention_type="modify",
                 intervention_params={
-                    "position": scenario_positions(batch["sample_id"], device),
-                    "direction": scenario_directions(batch["sample_id"], model.config.feature_dim, device),
+                    "position": positions,
+                    "direction": directions,
                     "radius": model.config.intervention_radius if args.intervention_radius is None else args.intervention_radius,
                 },
                 language_tokens=language_tokens,
                 input_ids=input_ids,
-                decoder_input_ids=cf_ids[:, :-1],
                 num_rollout_steps=model.config.num_propagation_steps,
+                max_new_tokens=args.generation_max_new_tokens,
             )
-            pred_cf_ids = cf_outputs.get("lm_logits_counterfactual").argmax(dim=-1).cpu()
+            pred_cf_ids = cf_outputs["generated_ids_counterfactual"].cpu()
             for i in range(len(batch["sample_id"])):
                 factual_pred = tokenizer.decode(factual_ids[i])
                 cf_pred = tokenizer.decode(pred_cf_ids[i])
@@ -260,55 +332,7 @@ def run_counterfactual_records(args, model, tokenizer, device, dataset_name: str
                 })
         return records
 
-    cf_file = find_counterfactual_file("MAG9" if dataset_name in {"MAG", "MAG9"} else "Lung")
-    if not cf_file:
-        return []
-    cf_df = pd.read_csv(cf_file)
-    if args.max_counterfactual_pairs:
-        cf_df = cf_df.iloc[:args.max_counterfactual_pairs]
-
-    from train_metacausal_field import CounterfactualPairDataset
-
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-    loader = DataLoader(
-        CounterfactualPairDataset(cf_df, tokenizer, transform),
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate,
-    )
-    records = []
-    for batch in tqdm(loader, desc="Stage counterfactual"):
-        input_ids = batch["input_ids"].to(device)
-        cf_input_ids = batch["cf_input_ids"].to(device)
-        backbone_outputs = encode_model_visual(model, cached_backbone, batch, device)
-        outputs = model.counterfactual_forward(
-            backbone_outputs["visual_features"],
-            intervention_type="modify",
-            intervention_params={
-                "position": scenario_positions(batch["scenario"], device),
-                "direction": scenario_directions(batch["scenario"], model.config.feature_dim, device),
-                "radius": model.config.intervention_radius if args.intervention_radius is None else args.intervention_radius,
-            },
-            language_tokens=backbone_outputs.get("language_tokens") if args.use_frozen_language_tokens else None,
-            input_ids=input_ids,
-            decoder_input_ids=cf_input_ids[:, :-1],
-            num_rollout_steps=model.config.num_propagation_steps,
-        )
-        pred_ids = outputs.get("lm_logits_counterfactual").argmax(dim=-1).cpu()
-        for i in range(len(batch["scenario"])):
-            records.append({
-                "factual_pred": "",
-                "cf_pred": tokenizer.decode(pred_ids[i]),
-                "factual_gold": "",
-                "cf_gold": tokenizer.decode(cf_input_ids[i, 1:]),
-                "should_flip": True,
-                "invalid_transition": not torch.isfinite(outputs["score_counterfactual"][i]).item(),
-            })
-    return records
+    return []
 
 
 def normalize_bool(value) -> bool:
@@ -316,41 +340,71 @@ def normalize_bool(value) -> bool:
 
 
 def run_pipeline(args):
+    set_global_seed(getattr(args, "seed", 42))
     device = torch.device(args.device if torch.cuda.is_available() and args.device != "cpu" else "cpu")
-    samples, manifest_factor_names = load_benchmark(args.dataset, args.manifest_path, args.data_root)
-    train_samples = [s for s in samples if s.split in {"train", "val", "validation"}]
-    test_samples = [s for s in samples if s.split in {"test", "eval"}] or samples
+    samples, manifest_factor_names = load_benchmark(
+        args.dataset,
+        args.manifest_path,
+        args.data_root,
+        seed=getattr(args, "seed", 42),
+    )
+    train_samples, val_samples, test_samples = strict_sample_partitions(samples)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     results = {}
 
-    discovered_factors = discover_factors_from_dataset(train_samples or samples)
-    if not discovered_factors:
-        discovered_factors = manifest_factor_names
+    discovered_factors = discover_factors_from_dataset(train_samples)
     gold_factors = manifest_factor_names or discovered_factors
     results["factor_discovery"] = {
         "discovered_factors": discovered_factors,
         "gold_factors": gold_factors,
+        "status": "available" if discovered_factors else "unavailable_no_varying_training_factors",
     }
 
-    fci_edges = learn_structure_fci(train_samples or samples, discovered_factors)
+    fci_edges, structure_method = learn_structure_fci(train_samples, discovered_factors)
     gold_edges = load_gold_edges(args.gold_graph) if args.gold_graph else gold_edges_from_samples(samples)
     results["structure_learning"] = {
-        "pred_edges_fci": fci_edges,
         "gold_edges": gold_edges,
-        "metrics_fci": structure_metrics(discovered_factors, gold_factors, fci_edges, gold_edges),
+        "classical_method": structure_method,
     }
+    if structure_method == "fci":
+        results["structure_learning"]["pred_edges_fci"] = fci_edges
+        results["structure_learning"]["metrics_fci"] = structure_metrics(
+            discovered_factors, gold_factors, fci_edges, gold_edges,
+        )
+    elif structure_method.startswith("correlation_smoke_fallback"):
+        results["structure_learning"]["pred_edges_correlation_smoke"] = fci_edges
+        results["structure_learning"]["metrics_correlation_smoke"] = structure_metrics(
+            discovered_factors, gold_factors, fci_edges, gold_edges,
+        )
+    else:
+        results["structure_learning"]["metrics_fci"] = {
+            "status": "unavailable",
+            "reason": structure_method,
+        }
 
     if args.checkpoint:
-        cached_backbone = CachedFrozenBackbone(args.feature_cache).to(device) if args.feature_cache else None
-        model, tokenizer, factor_columns, _, _ = load_model(
+        cached_backbone = (
+            CachedFrozenBackbone(
+                args.feature_cache,
+                allow_smoke_cache=args.allow_missing_media,
+            ).to(device)
+            if args.feature_cache
+            else None
+        )
+        model, tokenizer, factor_columns, _, loaded_checkpoint = load_model(
             args.checkpoint,
             device,
             visual_encoder=cached_backbone is None,
+            expected_dataset=args.dataset,
         )
         factor_names = factor_columns or discovered_factors
+        factor_graph_supervised = bool(
+            loaded_checkpoint.get("supervision", {}).get("factor_localizer")
+            and loaded_checkpoint.get("supervision", {}).get("factor_graph")
+        )
         qa_records, influence_edges = run_model_records(
             args,
             test_samples,
@@ -359,14 +413,24 @@ def run_pipeline(args):
             factor_names,
             device,
             cached_backbone=cached_backbone,
+            factor_graph_supervised=factor_graph_supervised,
         )
-        results["structure_learning"]["pred_edges_field"] = influence_edges
-        results["structure_learning"]["metrics_field"] = structure_metrics(
-            factor_names,
-            gold_factors,
-            influence_edges,
-            gold_edges,
-        )
+        if factor_graph_supervised:
+            results["structure_learning"]["pred_edges_field"] = influence_edges
+            results["structure_learning"]["metrics_field"] = structure_metrics(
+                factor_names,
+                gold_factors,
+                influence_edges,
+                gold_edges,
+            )
+        else:
+            results["structure_learning"]["metrics_field"] = {
+                "status": "unavailable",
+                "reason": (
+                    "Checkpoint does not contain supervised factor localization/graph metadata; "
+                    "patch influence weights are not reported as a named causal graph."
+                ),
+            }
         results["qa"] = qa_category_accuracy(qa_records)
         results["ood"] = ood_metrics(qa_records)
         cf_records = run_counterfactual_records(
@@ -407,6 +471,18 @@ def main():
     parser.add_argument("--intervention_radius", type=float, default=None)
     parser.add_argument("--max_counterfactual_pairs", type=int, default=32)
     parser.add_argument("--num_video_frames", type=int, default=8)
+    parser.add_argument(
+        "--generation_max_new_tokens",
+        type=int,
+        default=32,
+        help="Maximum autoregressive answer length; gold answer prefixes are never used.",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--allow_missing_media",
+        action="store_true",
+        help="Use white placeholder media for smoke tests only.",
+    )
     args = parser.parse_args()
     run_pipeline(args)
 

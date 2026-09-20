@@ -1,129 +1,96 @@
-# MetaCausalField
+# InfluenceField
 
-This repository contains code for multimodal causal discovery and the
-MetaCausalField research prototype. It includes the original MLLM-CD style
-pipeline for MAG/Lung causal discovery, plus a differentiable causal field
-implementation for intervention-aware multimodal reasoning.
+[![arXiv](https://img.shields.io/badge/arXiv-2609.07874-b31b1b.svg)](https://arxiv.org/abs/2609.07874)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+[![tests](https://github.com/qiuqiuqiu12277/Differentiable-Causal-Field/actions/workflows/tests.yml/badge.svg)](https://github.com/qiuqiuqiu12277/Differentiable-Causal-Field/actions/workflows/tests.yml)
 
-MetaCausalField follows the paper idea of placing a differentiable causal field
-between visual encoding and language-conditioned decoding. Visual patch or
-frozen MLLM tokens are lifted into a continuous spatial field, propagated with
-learned directional influence, and optionally intervened on for counterfactual
-rollout.
+Research code for **InfluenceField: A Differentiable Field with
+Interventionally Identifiable Causal Structure for Multimodal World
+Modeling**.
 
-## What Is Implemented
+InfluenceField inserts an intervention-aware latent field between a visual
+encoder and a language decoder. Visual patch features are lifted to a spatial
+field, a state-dependent directed operator propagates influence, and localized
+field edits are rolled out with the same transition operator.
 
-- Continuous Gaussian field construction from image/video/frozen visual tokens.
-- Dynamic directional influence and multi-step causal propagation.
-- Field-level interventions for object removal, attribute modification, and
-  custom latent edits.
-- Factual and counterfactual rollout trajectories with shared transition
-  dynamics.
-- Language-conditioned field fusion and lightweight text/score/factor heads.
-- Factor-level spatial attention and factor-level influence aggregation for
-  named causal graph evaluation.
-- MAG9 and Lung training/evaluation.
-- Unified manifest loaders for CLEVRER, Causal3DIdent/CITRIS, and Causal-VidQA.
-- Frozen feature extraction for ResNet, Qwen/Qwen3-VL style models, and closed
-  API responses.
-- Three-stage paper-style training and evaluation utilities.
-- OOD split construction, baseline runners, propagation sweeps, ablations, and
-  interpretability metrics.
+> **Release status.** This repository currently contains the core field
+> prototype, data adapters, evaluation utilities, and a small theorem-aligned
+> diagnostic. It is **not yet a self-contained reproduction package for every
+> number in the paper**: official datasets, the complete Qwen3-VL training
+> stack, paper checkpoints, raw predictions, and full split manifests are not
+> bundled. See [REPRODUCIBILITY.md](REPRODUCIBILITY.md) for an exact status map.
 
-Large official benchmark assets, pretrained Qwen weights, API credentials, and
-paper-table checkpoints are not bundled. To reproduce final numbers, provide the
-official datasets and run the experiment commands below.
+## Scientific scope
 
-## Main Files
+The paper's causal result concerns the dependency graph of the **complete
+transition operator** under target-aligned interventions and explicit coverage,
+regularity, and separation assumptions. Raw attention or influence weights are
+not causal merely because they are asymmetric or sparse. The included
+synthetic diagnostic makes this distinction executable; MAG/Lung and local
+image utilities should be treated as research adapters rather than independent
+proof of identifiability.
 
-- `metacausal_field.py`: Core MetaCausalField model, losses, interventions, and
-  visualization helpers.
-- `train_metacausal_field.py`: MAG9/Lung training.
-- `train_benchmark_metacausal.py`: Unified benchmark manifest training.
-- `train_three_stage_metacausal.py`: Three-stage MAG9/Lung trainer.
-- `three_stage_metacausal_pipeline.py`: Factor discovery, structure evaluation,
-  QA, OOD, and counterfactual evaluation.
-- `extract_frozen_features.py`: Frozen ResNet/Qwen/API feature cache extraction.
-- `run_paper_experiments.py`: Orchestrates validate/features/train/eval/OOD and
-  baseline stages.
-- `prepare_causalvqa_manifest.py`: Converts common CausalVQA/Causal-VidQA
-  annotation layouts into the unified JSONL schema.
-- `run_baseline_matrix.py`: Runs batches of majority/random/HF/Gemini baselines.
-- `benchmark_datasets.py`: Unified dataset schema and adapters.
-- `causal_metrics.py`: Graph, QA, OOD, counterfactual, and interpretability
-  metrics.
-- `main_MAG.py`, `main_Lung.py`, `utils.py`: Original MLLM-CD style MAG/Lung
-  pipeline.
+## Repository status
 
-## Data
-
-Bundled tabular files:
-
-- `MAG9.csv`
-- `Lung.csv`
-- `gold_graphs/mag9_gold_graph.csv`
-- `gold_graphs/lung_gold_graph.csv`
-- generated counterfactual CSVs under `results/`
-
-Expected local image folders:
-
-- `apple_images_a9/`
-- `Lung/`
-
-For external benchmarks, use a JSONL/JSON/CSV manifest. A typical JSONL record:
-
-```json
-{
-  "sample_id": "example-1",
-  "split": "test",
-  "image_path": "frames/example.png",
-  "video_path": "videos/example.mp4",
-  "question": "What happens if the red object is removed?",
-  "answer": "The blue object will not move.",
-  "question_type": "Counterfactual",
-  "factors": {"red_object": 1, "blue_object": 1},
-  "graph_edges": [["red_object", "blue_object"]],
-  "intervention": {"target": "red_object", "type": "remove"},
-  "cf_answer": "The blue object will not move.",
-  "counterfactual_image_path": "frames/example_cf.png",
-  "ood_type": "Intervention Shift",
-  "object_id": "red_object",
-  "bbox": [0.1, 0.2, 0.3, 0.4]
-}
-```
+| Component | Status | Notes |
+|---|---:|---|
+| Continuous Gaussian field and multi-step propagation | Available | `metacausal_field.py` |
+| Local field interventions and counterfactual rollout | Available | Prototype interface |
+| Stable, CPU-only identifiability diagnostic | Available | Emits JSON and CSV; not a paper-table reproduction |
+| MAG/Lung adapters and graph metrics | Available | Includes legacy MLLM-CD-derived material; see notices |
+| CLEVRER/CITRIS/Causal3D/CausalVQA manifest adapters | Partial | Requires official external assets |
+| Full three-stage Qwen3-VL paper training | Not bundled | Requires paper-scale data, weights, and compute |
+| Paper checkpoints, raw predictions, and frozen manifests | Not bundled | Do not infer paper results from smoke tests |
 
 ## Installation
 
-Use Python 3.10+ when possible.
+Create an isolated Python 3.10+ environment, then install the local package:
 
 ```bash
-pip install torch torchvision torchaudio
-pip install numpy pandas pillow matplotlib tqdm scikit-learn pydot causal-learn
-pip install transformers huggingface_hub
+python -m pip install -e '.[data,dev]'
 ```
 
-Closed API feature extraction also requires the relevant API environment
-variables used by `gemini_utils.py`.
-
-## Quick Checks
+Optional benchmark and MLLM integrations:
 
 ```bash
-python -m py_compile \
-  metacausal_field.py benchmark_datasets.py frozen_backbones.py \
-  extract_frozen_features.py train_metacausal_field.py \
-  train_benchmark_metacausal.py train_three_stage_metacausal.py \
-  evaluate_metacausal_field.py evaluate_interpretability.py \
-  three_stage_metacausal_pipeline.py run_paper_experiments.py \
-  prepare_causalvqa_manifest.py run_baseline_matrix.py \
-  causal_metrics.py test_metacausal_field.py
-
-python test_metacausal_field.py
-python run_paper_experiments.py --dataset MAG9 --mode validate --output_dir /tmp/mcf_validate
+python -m pip install -e '.[benchmarks]'
 ```
 
-## MAG9/Lung Training
+The benchmark extra is intentionally separate because it downloads a much
+larger dependency stack. Model weights and datasets are never downloaded by the
+unit tests.
 
-Train the local ResNet-backed model:
+## Verified quick start
+
+Run the unit tests:
+
+```bash
+pytest
+```
+
+Run the quick theorem-aligned diagnostic:
+
+```bash
+python -m experiments.synthetic_identifiability \
+  --quick \
+  --output-dir outputs/synthetic-smoke
+```
+
+The command constructs observationally equivalent linear transitions under
+0/25/50/100% known-site intervention coverage. It writes:
+
+- `metrics.json`: configuration, scope statement, and aggregate metrics;
+- `runs.csv`: seed-level recovery and residual measurements.
+
+At full coverage the constructed ambiguity is restricted to coordinate-wise
+scaling and edge support is recovered exactly. At partial coverage only the
+covered subgraph is asserted to be preserved. This is a constructive diagnostic
+of the theorem's mechanism, not evidence for the full nonlinear multimodal
+model.
+
+## Local prototype training
+
+MAG/Lung training remains available for development:
 
 ```bash
 python train_metacausal_field.py \
@@ -135,231 +102,93 @@ python train_metacausal_field.py \
   --num_propagation_steps 3
 ```
 
-Run the paper-style staged schedule:
+The corresponding image directories are not included. Missing media now fail
+closed unless a script explicitly enables a synthetic fallback. A successful
+run on placeholder images must never be reported as a benchmark result.
 
-```bash
-python train_three_stage_metacausal.py \
-  --dataset MAG9 \
-  --epochs_per_stage 3 \
-  --batch_size 8 \
-  --feature_dim 256 \
-  --num_heads 4 \
-  --num_propagation_steps 3 \
-  --output_dir three_stage_training
-```
-
-Evaluate a checkpoint:
-
-```bash
-python evaluate_metacausal_field.py \
-  --checkpoint outputs/<run>/best_model.pth \
-  --dataset Lung
-```
-
-## Frozen Qwen/API Features
-
-Download or resolve Qwen weights:
-
-```bash
-python download_qwen_weights.py \
-  --model_id Qwen/Qwen3-VL-8B-Instruct \
-  --local_dir models/Qwen__Qwen3-VL-8B-Instruct
-```
-
-Extract frozen features:
-
-```bash
-python extract_frozen_features.py \
-  --dataset Lung \
-  --backbone qwen \
-  --qwen_model models/Qwen__Qwen3-VL-8B-Instruct \
-  --output frozen_features/lung_qwen3vl.pt \
-  --feature_dim 256
-```
-
-Train MetaCausalField on cached frozen tokens:
-
-```bash
-python train_metacausal_field.py \
-  --dataset Lung \
-  --backbone cached \
-  --feature_cache frozen_features/lung_qwen3vl.pt \
-  --use_frozen_language_tokens \
-  --epochs 20
-```
-
-For benchmark manifests, direct Qwen-backed training is also available:
+For manifest-backed datasets:
 
 ```bash
 python train_benchmark_metacausal.py \
   --dataset Causal-VidQA \
-  --manifest_path data/causal_vidqa/manifest.jsonl \
-  --data_root data/causal_vidqa \
-  --backbone qwen \
-  --qwen_model models/Qwen__Qwen3-VL-8B-Instruct \
-  --use_frozen_language_tokens \
-  --num_video_frames 8
+  --manifest_path /path/to/manifest.jsonl \
+  --data_root /path/to/dataset \
+  --epochs 5 \
+  --batch_size 4
 ```
 
-For a closer partially frozen Qwen-style setup, train only LoRA adapters in the
-backbone while optimizing MetaCausalField:
-
-```bash
-python train_benchmark_metacausal.py \
-  --dataset Causal-VidQA \
-  --manifest_path data/causal_vidqa/manifest.jsonl \
-  --data_root data/causal_vidqa \
-  --backbone qwen \
-  --qwen_model models/Qwen__Qwen3-VL-8B-Instruct \
-  --train_qwen_lora \
-  --qwen_lora_r 8 \
-  --use_frozen_language_tokens \
-  --qwen_video_input native
-```
-
-## Benchmark Manifests
-
-Convert native benchmark annotations:
-
-```bash
-python convert_benchmarks.py \
-  --benchmark CLEVRER \
-  --input data/clevrer/questions.json \
-  --data_root data/clevrer \
-  --output data/clevrer/manifest.jsonl
-```
-
-For CausalVQA/Causal-VidQA annotations with mixed nested or flat layouts:
+The manifest must contain non-empty `train`, `val`, and `test` partitions.
+Shared factual or counterfactual media may not cross partitions. The
+CausalVQA converter can create deterministic media-group splits:
 
 ```bash
 python prepare_causalvqa_manifest.py \
-  --input data/causalvqa/annotations.json \
-  --data_root data/causalvqa \
-  --output data/causalvqa/manifest.jsonl
+  --input /path/to/annotations.json \
+  --data_root /path/to/media \
+  --output /path/to/manifest.jsonl \
+  --seed 42
 ```
 
-Train on a unified manifest:
+## Integrity guards
 
-```bash
-python train_benchmark_metacausal.py \
-  --dataset Causal-VidQA \
-  --manifest_path data/causal_vidqa/manifest.jsonl \
-  --data_root data/causal_vidqa \
-  --epochs 5 \
-  --batch_size 4 \
-  --num_video_frames 8 \
-  --enable_cf_trajectory_loss
+- Generative QA metrics use free-running decoding from `<bos>`; teacher-forced
+  values are labelled as perplexity only.
+- Evaluation restores exact checkpoint split IDs when available and defaults
+  to the held-out test partition.
+- Missing media, mismatched datasets/backbones, partial checkpoints, and
+  duplicate feature-cache keys fail closed.
+- Counterfactual supervision accepts only explicit, supported latent edits;
+  scenario-name hashes are limited to labelled smoke utilities.
+- Unsupervised factor-localization heads are not reported as causal graphs.
+- FCI failures are labelled as a correlation smoke fallback, never as FCI.
+- OOD evaluation accepts only evidence-backed test/eval/ood records; synthetic
+  template paraphrases are opt-in and excluded from paper-style aggregates.
+
+See [REPRODUCIBILITY.md](REPRODUCIBILITY.md) before comparing any local output
+with a paper table.
+
+## Main files
+
+- `metacausal_field.py` - field construction, directed propagation,
+  interventions, task heads, and losses.
+- `experiments/synthetic_identifiability.py` - auditable linear coverage
+  diagnostic.
+- `train_metacausal_field.py` - local MAG/Lung prototype trainer.
+- `train_benchmark_metacausal.py` - unified manifest trainer.
+- `benchmark_datasets.py` - dataset schema and media loading.
+- `three_stage_metacausal_pipeline.py` - staged structure/QA/CF evaluation.
+- `causal_metrics.py` - graph, QA, OOD, and counterfactual metrics.
+- `prepare_causalvqa_manifest.py` - annotation-to-manifest conversion.
+
+## Reproducibility rules
+
+1. Use explicit train/validation/test splits and select checkpoints on
+   validation only.
+2. Record seeds, resolved configuration, input-manifest checksum, checkpoint
+   checksum, and raw predictions.
+3. Do not call a raw attention matrix an identified causal graph. Evaluate the
+   complete transition Jacobian or an explicitly justified surrogate.
+4. Do not report paper-table numbers from generated placeholders, teacher-forced
+   decoding, or metadata-only "OOD" variants.
+5. Label smoke tests, partial reproductions, and full reproductions separately.
+
+## Paper
+
+- [arXiv:2609.07874](https://arxiv.org/abs/2609.07874)
+
+```bibtex
+@article{yang2026influencefield,
+  title   = {InfluenceField: A Differentiable Field with Interventionally
+             Identifiable Causal Structure for Multimodal World Modeling},
+  author  = {Yang, Zihao and Wang, Zijia and Huang, Zhiqiu},
+  journal = {arXiv preprint arXiv:2609.07874},
+  year    = {2026}
+}
 ```
 
-Build OOD splits:
+## Provenance and licensing
 
-```bash
-python build_ood_splits.py \
-  --manifest_path data/causal_vidqa/manifest.jsonl \
-  --data_root data/causal_vidqa \
-  --output data/causal_vidqa/ood_manifest.jsonl
-```
-
-Run the three-stage evaluator:
-
-```bash
-python three_stage_metacausal_pipeline.py \
-  --dataset Causal-VidQA \
-  --manifest_path data/causal_vidqa/manifest.jsonl \
-  --data_root data/causal_vidqa \
-  --checkpoint benchmark_outputs/<run>/best_model.pth \
-  --output_dir three_stage_outputs/causal_vidqa
-```
-
-## Paper-Style Orchestration
-
-Inspect commands without launching long jobs:
-
-```bash
-python run_paper_experiments.py \
-  --dataset MAG9 \
-  --mode all \
-  --dry_run \
-  --backbone qwen \
-  --feature_cache frozen_features/mag9_qwen3vl.pt \
-  --epochs 1
-```
-
-Run individual stages:
-
-```bash
-python run_paper_experiments.py --dataset MAG9 --mode validate
-python run_paper_experiments.py --dataset MAG9 --mode features --backbone cached
-python run_paper_experiments.py --dataset MAG9 --mode train --backbone cached
-python run_paper_experiments.py --dataset MAG9 --mode eval --checkpoint <best_model.pth>
-```
-
-For external benchmark baselines:
-
-```bash
-python run_baselines.py \
-  --dataset Causal-VidQA \
-  --manifest_path data/causal_vidqa/manifest.jsonl \
-  --backend hf \
-  --model Qwen/Qwen3-VL-8B-Instruct \
-  --output baseline_predictions.jsonl
-```
-
-Run a baseline matrix:
-
-```bash
-python run_baseline_matrix.py \
-  --dataset Causal-VidQA \
-  --manifest_path data/causal_vidqa/manifest.jsonl \
-  --data_root data/causal_vidqa \
-  --default_paper_models \
-  --include_majority \
-  --output_dir baseline_matrix/causal_vidqa
-```
-
-## Inference
-
-Prediction:
-
-```bash
-python inference_metacausal_field.py \
-  --checkpoint outputs/<run>/best_model.pth \
-  --image Lung/1.jpg \
-  predict
-```
-
-Explanation:
-
-```bash
-python inference_metacausal_field.py \
-  --checkpoint outputs/<run>/best_model.pth \
-  --image Lung/1.jpg \
-  explain
-```
-
-Counterfactual:
-
-```bash
-python inference_metacausal_field.py \
-  --checkpoint outputs/<run>/best_model.pth \
-  --image Lung/1.jpg \
-  counterfactual \
-  --scenario smoking
-```
-
-## Notes and Limitations
-
-- Qwen/API paths are frozen feature providers. They do not fine-tune the native
-  Qwen decoder. `--train_qwen_lora` adds optional LoRA training to the Qwen
-  feature provider, but the answer decoder is still the repository's lightweight
-  head rather than the native Qwen decoder.
-- Counterfactual trajectory supervision is strongest when manifests include
-  paired counterfactual images/videos or cached counterfactual features.
-- Factor-level graph extraction is learned through factor supervision and
-  spatial attention; graph quality depends on data quality and training.
-- Dense spatial influence is still quadratic in field size. `--influence_top_k`
-  sparsifies the learned graph output after scoring, but does not make the
-  attention computation fully sparse.
-- The repository provides scripts needed to reproduce paper-style experiments,
-  but final paper tables require official benchmark assets, model weights/API
-  access, and trained checkpoints.
+This repository contains legacy files and data derived from the MLLM-CD
+research release. Read [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) before
+redistributing them. No repository-wide open-source license is asserted here;
+see [LICENSE_STATUS.md](LICENSE_STATUS.md).

@@ -1,8 +1,8 @@
-"""Orchestrate paper-style MetaCausalField experiments.
+"""Orchestrate paper-inspired InfluenceField prototype experiments.
 
 This script wires together the runnable pieces needed for the PDF protocol:
 benchmark conversion/validation, frozen MLLM feature extraction, staged
-training, three-stage evaluation, OOD construction, and baseline scoring.
+training, three-stage evaluation, OOD manifest validation, and baseline scoring.
 
 It intentionally does not download private/large benchmark files by itself.
 Provide official annotations/manifests through the command line and use
@@ -26,10 +26,17 @@ def run(cmd, dry_run: bool = False):
         subprocess.run([str(x) for x in cmd], check=True)
 
 
-def validate_manifest(dataset: str, manifest_path: str | None, data_root: str | None, output_dir: Path):
-    samples, factors = load_benchmark(dataset, manifest_path, data_root)
+def validate_manifest(
+    dataset: str,
+    manifest_path: str | None,
+    data_root: str | None,
+    output_dir: Path,
+    seed: int,
+):
+    samples, factors = load_benchmark(dataset, manifest_path, data_root, seed=seed)
     summary = {
         "dataset": dataset,
+        "seed": seed,
         "num_samples": len(samples),
         "num_factors": len(factors),
         "splits": sorted({s.split for s in samples}),
@@ -53,7 +60,7 @@ def latest_checkpoint(root: Path) -> Path | None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run paper-style MetaCausalField experiment stages")
+    parser = argparse.ArgumentParser(description="Run paper-inspired InfluenceField prototype stages")
     parser.add_argument("--dataset", required=True, choices=["MAG9", "Lung", "CLEVRER", "Causal3DIdent", "CITRIS", "Causal-VidQA"])
     parser.add_argument("--manifest_path", default=None)
     parser.add_argument("--data_root", default=None)
@@ -62,6 +69,7 @@ def main():
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--mode", default="all", choices=["validate", "features", "train", "eval", "ood", "baseline", "all"])
     parser.add_argument("--dry_run", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--backbone", default="cached", choices=["cached", "resnet", "qwen"])
     parser.add_argument("--feature_cache", default=None)
@@ -87,6 +95,11 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--baseline_backend", default="majority", choices=["majority", "random", "gemini", "hf"])
     parser.add_argument("--baseline_model", default=None)
+    parser.add_argument(
+        "--synthetic_template_smoke",
+        action="store_true",
+        help="Add clearly labelled template paraphrases for plumbing checks only; never a paper OOD metric.",
+    )
     args = parser.parse_args()
 
     root = Path(args.output_dir) / args.dataset
@@ -94,9 +107,9 @@ def main():
     feature_cache = Path(args.feature_cache) if args.feature_cache else root / f"{args.extract_backbone}_features.pt"
 
     if args.mode in {"validate", "all"}:
-        validate_manifest(args.dataset, args.manifest_path, args.data_root, root)
+        validate_manifest(args.dataset, args.manifest_path, args.data_root, root, args.seed)
 
-    needs_feature_cache = args.backbone == "cached" or (args.backbone == "qwen" and args.dataset in {"MAG9", "Lung"})
+    needs_feature_cache = args.backbone in {"cached", "qwen"}
     if args.mode in {"features", "all"} and needs_feature_cache:
         cmd = [
             sys.executable, "extract_frozen_features.py",
@@ -105,6 +118,7 @@ def main():
             "--output", feature_cache,
             "--feature_dim", args.feature_dim,
             "--device", args.device,
+            "--seed", args.seed,
         ]
         if args.manifest_path:
             cmd.extend(["--manifest_path", args.manifest_path])
@@ -133,6 +147,7 @@ def main():
                 "--num_heads", args.num_heads,
                 "--num_propagation_steps", args.num_propagation_steps,
                 "--backbone", stage_backbone,
+                "--seed", args.seed,
             ]
             if stage_backbone == "cached":
                 cmd.extend(["--feature_cache", feature_cache])
@@ -153,6 +168,7 @@ def main():
                 "--num_propagation_steps", args.num_propagation_steps,
                 "--backbone", args.backbone,
                 "--device", args.device,
+                "--seed", args.seed,
             ]
             if args.data_root:
                 cmd.extend(["--data_root", args.data_root])
@@ -182,18 +198,26 @@ def main():
 
     if args.mode in {"ood", "all"} and args.manifest_path:
         ood_manifest = root / "ood_manifest.jsonl"
-        run([
+        ood_cmd = [
             sys.executable, "build_ood_splits.py",
             "--manifest_path", args.manifest_path,
             "--output", ood_manifest,
             *([] if not args.data_root else ["--data_root", args.data_root]),
-        ], args.dry_run)
+        ]
+        if args.synthetic_template_smoke:
+            ood_cmd.append("--synthetic_template_smoke")
+        run(ood_cmd, args.dry_run)
 
     if args.mode in {"eval", "all"}:
         checkpoint = Path(args.checkpoint) if args.checkpoint else latest_checkpoint(checkpoint_hint)
         if checkpoint is None:
             print("Evaluation skipped: no checkpoint found yet. Pass --checkpoint <best_model.pth> after training.")
         else:
+            if args.backbone == "qwen" and args.train_qwen_lora:
+                raise RuntimeError(
+                    "The generic three-stage evaluator cannot reconstruct a trained Qwen LoRA adapter. "
+                    "Export a matching post-training feature cache or use a dedicated Qwen evaluator."
+                )
             cmd = [
                 sys.executable, "three_stage_metacausal_pipeline.py",
                 "--dataset", args.dataset,
@@ -201,6 +225,7 @@ def main():
                 "--output_dir", root / "eval",
                 "--batch_size", args.batch_size,
                 "--device", args.device,
+                "--seed", args.seed,
             ]
             if args.manifest_path:
                 cmd.extend(["--manifest_path", args.manifest_path])
@@ -208,7 +233,7 @@ def main():
                 cmd.extend(["--data_root", args.data_root])
             if args.gold_graph:
                 cmd.extend(["--gold_graph", args.gold_graph])
-            if args.backbone == "cached":
+            if args.backbone in {"cached", "qwen"}:
                 cmd.extend(["--feature_cache", feature_cache])
             if args.use_frozen_language_tokens:
                 cmd.append("--use_frozen_language_tokens")
@@ -221,6 +246,7 @@ def main():
             "--manifest_path", args.manifest_path,
             "--backend", args.baseline_backend,
             "--output", root / f"baseline_{args.baseline_backend}.jsonl",
+            "--seed", args.seed,
         ]
         if args.data_root:
             cmd.extend(["--data_root", args.data_root])

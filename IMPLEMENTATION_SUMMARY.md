@@ -1,3 +1,9 @@
+# 早期 MetaCausalField 实现总结（归档）
+
+> **状态：** 下方的“完整实现”标记只表示早期原型文件已编写，
+> 不表示 InfluenceField 论文的数据、训练配置和表格已可复现。当前状态见
+> [REPRODUCIBILITY.md](REPRODUCIBILITY.md)。
+
 # MetaCausalField 实现总结
 
 本文档总结了基于论文 Section 3 的完整实现，包括所有新增和修改的文件。

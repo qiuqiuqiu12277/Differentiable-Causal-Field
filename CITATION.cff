@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+message: "If you use InfluenceField, please cite the paper below."
+title: "InfluenceField: A Differentiable Field with Interventionally Identifiable Causal Structure for Multimodal World Modeling"
+type: software
+version: 0.1.0
+date-released: 2026-09-07
+url: "https://github.com/qiuqiuqiu12277/Differentiable-Causal-Field"
+repository-code: "https://github.com/qiuqiuqiu12277/Differentiable-Causal-Field"
+identifiers:
+  - type: other
+    value: "arXiv:2609.07874"
+    description: arXiv identifier
+authors:
+  - family-names: Yang
+    given-names: Zihao
+  - family-names: Wang
+    given-names: Zijia
+  - family-names: Huang
+    given-names: Zhiqiu
+preferred-citation:
+  type: article
+  title: "InfluenceField: A Differentiable Field with Interventionally Identifiable Causal Structure for Multimodal World Modeling"
+  year: 2026
+  url: "https://arxiv.org/abs/2609.07874"
+  authors:
+    - family-names: Yang
+      given-names: Zihao
+    - family-names: Wang
+      given-names: Zijia
+    - family-names: Huang
+      given-names: Zhiqiu

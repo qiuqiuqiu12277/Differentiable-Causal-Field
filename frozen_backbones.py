@@ -13,7 +13,7 @@ import json
 import os
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -27,6 +27,16 @@ def _hash_key(*parts: str) -> str:
         h.update(str(part).encode("utf-8"))
         h.update(b"\0")
     return h.hexdigest()
+
+
+def load_torch_payload(path, map_location="cpu"):
+    """Load repository-owned caches across supported PyTorch releases."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError as exc:
+        if "weights_only" not in str(exc):
+            raise
+        return torch.load(path, map_location=map_location)
 
 
 def download_qwen_weights(
@@ -139,16 +149,23 @@ class CachedFrozenBackbone(FrozenBackbone):
           }
         }
 
-    The key is either an explicit sample id or sha256(image_path, text).
+    Keys must be explicit sample/question identifiers. Media-path defaults are
+    unsafe because multiple questions can share one video and overwrite tokens.
     """
 
-    def __init__(self, cache_path: str, feature_dim: Optional[int] = None):
+    def __init__(
+        self,
+        cache_path: str,
+        feature_dim: Optional[int] = None,
+        *,
+        allow_smoke_cache: bool = False,
+    ):
         super().__init__()
         self.cache_path = Path(cache_path)
         if not self.cache_path.exists():
             raise FileNotFoundError(f"Feature cache not found: {self.cache_path}")
         if self.cache_path.suffix == ".pt":
-            payload = torch.load(self.cache_path, map_location="cpu", weights_only=False)
+            payload = load_torch_payload(self.cache_path)
         else:
             payload = {"items": {}}
             with open(self.cache_path) as f:
@@ -162,7 +179,50 @@ class CachedFrozenBackbone(FrozenBackbone):
                     }
             payload["feature_dim"] = feature_dim
         self.items = payload["items"]
+        self.metadata = {
+            key: value for key, value in payload.items()
+            if key not in {"items", "tokenizer"}
+        }
+        if not self.items:
+            raise ValueError(f"Feature cache contains no items: {self.cache_path}")
+        if self.metadata.get("smoke_cache") and not allow_smoke_cache:
+            raise ValueError(
+                f"Feature cache {self.cache_path} is labelled as a smoke cache. "
+                "Enable the caller's explicit smoke/missing-media flag to use it."
+            )
         self.feature_dim = int(payload.get("feature_dim") or feature_dim or self._infer_dim())
+        language_schema = set()
+        for key, item in self.items.items():
+            if not isinstance(item, dict) or "visual_features" not in item:
+                raise ValueError(f"Feature cache key {key!r} has no visual_features tensor")
+            visual = item["visual_features"]
+            if not isinstance(visual, torch.Tensor) or visual.ndim != 2:
+                raise ValueError(
+                    f"Feature cache key {key!r} visual_features must be a rank-2 tensor"
+                )
+            if visual.shape[-1] != self.feature_dim:
+                raise ValueError(
+                    f"Feature cache key {key!r} has dimension {visual.shape[-1]}, "
+                    f"expected {self.feature_dim}"
+                )
+            has_language = "language_tokens" in item
+            language_schema.add(has_language)
+            if has_language:
+                language = item["language_tokens"]
+                if not isinstance(language, torch.Tensor) or language.ndim != 2:
+                    raise ValueError(
+                        f"Feature cache key {key!r} language_tokens must be a rank-2 tensor"
+                    )
+                if language.shape[-1] != self.feature_dim:
+                    raise ValueError(
+                        f"Feature cache key {key!r} language dimension {language.shape[-1]}, "
+                        f"expected {self.feature_dim}"
+                    )
+        if len(language_schema) > 1:
+            raise ValueError(
+                "Feature cache mixes entries with and without language_tokens; "
+                "use a consistent cache schema."
+            )
 
     def _infer_dim(self) -> int:
         first = next(iter(self.items.values()))
@@ -179,10 +239,16 @@ class CachedFrozenBackbone(FrozenBackbone):
             if key not in self.items:
                 raise KeyError(f"Missing frozen feature cache key: {key}")
             item = self.items[key]
-            if "visual_features" in item:
-                visual.append(item["visual_features"])
+            if "visual_features" not in item:
+                raise KeyError(f"Cache key {key!r} has no visual_features tensor")
+            visual.append(item["visual_features"])
             if "language_tokens" in item:
                 text.append(item["language_tokens"])
+        if text and len(text) != len(keys):
+            raise ValueError(
+                "Feature cache mixes entries with and without language_tokens; "
+                "batches must use a consistent cache schema."
+            )
         outputs = {}
         if visual:
             outputs["visual_features"] = _pad_token_sequences(visual).to(device)
@@ -328,8 +394,12 @@ class QwenVLFrozenBackbone(FrozenBackbone):
         self.proj = None
         if self.feature_dim != self.hidden_size:
             self.proj = nn.Linear(self.hidden_size, self.feature_dim, bias=False)
-            generator = torch.Generator().manual_seed(17)
-            nn.init.orthogonal_(self.proj.weight, gain=1.0)
+            # ``orthogonal_`` did not accept a generator on older supported
+            # PyTorch releases. Fork the RNG so initialization is reproducible
+            # without perturbing the caller's global random stream.
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(17)
+                nn.init.orthogonal_(self.proj.weight, gain=1.0)
             for param in self.proj.parameters():
                 param.requires_grad = self.trainable_lora
         self.image_token_ids, self.text_exclude_ids = _special_token_ids(self.processor, self.model)
@@ -416,8 +486,10 @@ class ClosedAPIFrozenBackbone(FrozenBackbone):
     Most closed MLLM APIs do not expose internal embeddings. This adapter uses
     an explicit response/embedding cache protocol: if the API response contains
     `visual_features` or `language_tokens`, those frozen embeddings are used.
-    Otherwise it stores the raw response and derives deterministic text tokens
-    from the frozen response text, making the limitation visible in the cache.
+    If the response lacks visual features, the adapter fails closed by default.
+    An explicitly enabled smoke mode can derive deterministic response-text
+    tokens for plumbing tests; those tokens are labelled as a non-visual
+    surrogate in the returned metadata.
     """
 
     def __init__(
@@ -426,16 +498,25 @@ class ClosedAPIFrozenBackbone(FrozenBackbone):
         tokenizer: SimpleTokenizer,
         feature_dim: int,
         cache_path: str = "./api_feature_cache.pt",
+        allow_response_text_smoke: bool = False,
     ):
         super().__init__()
         self.api_generate = api_generate
         self.tokenizer = tokenizer
         self.feature_dim = feature_dim
-        self.text_encoder = TextEncoder(tokenizer.vocab_size, feature_dim, tokenizer.max_length, dropout=0.0)
+        self.allow_response_text_smoke = bool(allow_response_text_smoke)
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(23)
+            self.text_encoder = TextEncoder(
+                tokenizer.vocab_size,
+                feature_dim,
+                tokenizer.max_length,
+                dropout=0.0,
+            )
         for param in self.text_encoder.parameters():
             param.requires_grad = False
         self.cache_path = Path(cache_path)
-        self.cache = torch.load(self.cache_path, map_location="cpu", weights_only=False) if self.cache_path.exists() else {}
+        self.cache = load_torch_payload(self.cache_path) if self.cache_path.exists() else {}
 
     def _response_for(self, image_path: str, text: str) -> Dict:
         key = _hash_key(image_path, text)
@@ -454,6 +535,11 @@ class ClosedAPIFrozenBackbone(FrozenBackbone):
         if all("visual_features" in r for r in responses):
             visual = torch.stack([torch.tensor(r["visual_features"], dtype=torch.float32) for r in responses]).to(device)
         else:
+            if not self.allow_response_text_smoke:
+                raise RuntimeError(
+                    "The closed API did not return visual_features. Response-text embeddings are "
+                    "not visual features; enable the explicit API text smoke mode only for plumbing tests."
+                )
             ids = torch.tensor(
                 [self.tokenizer.encode(r.get("text", "")) for r in responses],
                 dtype=torch.long,
@@ -473,6 +559,9 @@ class ClosedAPIFrozenBackbone(FrozenBackbone):
             "visual_features": visual,
             "language_tokens": language,
             "api_responses": [r.get("text", "") for r in responses],
+            "response_text_surrogate_smoke": not all(
+                "visual_features" in response for response in responses
+            ),
         }
 
 
